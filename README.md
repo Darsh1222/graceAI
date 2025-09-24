@@ -1,10 +1,10 @@
-# 🎵 graceAI - Music Practice Analysis App
+# 🎵 GraceAI - Music Practice Analysis App
 
 A sophisticated iOS application that uses AI to analyze your music practice sessions, providing detailed feedback on accuracy, rhythm, and performance improvement over time.
 
-## 🎯 What Does graceAI Do?
+## 🎯 What Does GraceAI Do?
 
-graceAI is a revolutionary music practice companion that transforms how musicians improve their skills. Here's how it works:
+GraceAI is a revolutionary music practice companion that transforms how musicians improve their skills. Here's how it works:
 
 ### The Process
 1. **Record Your Practice**: Use your iPhone to record yourself playing a piece of music
@@ -95,8 +95,8 @@ graceAI is a revolutionary music practice companion that transforms how musician
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/yourusername/graceAI.git
-   cd graceAI
+   git clone https://github.com/yourusername/GraceAI.git
+   cd GraceAI
    ```
 
 2. **Install iOS dependencies**
@@ -245,7 +245,7 @@ CREATE TRIGGER on_auth_user_created
 
 ### App Structure
 ```
-graceAI/
+GraceAI/
 ├── TuneIn Cursor/           # iOS App
 │   ├── ContentView.swift    # Main UI and business logic
 │   ├── Models/              # Data models
