@@ -11,6 +11,11 @@ import AVFoundation
 import UniformTypeIdentifiers
 import Supabase
 
+// MARK: - Notification Names
+extension Notification.Name {
+    static let newSessionSaved = Notification.Name("newSessionSaved")
+}
+
 // MARK: - Backend Configuration
 struct BackendConfig {
     // Toggle between local and cloud backend
@@ -262,6 +267,7 @@ class SupabaseService: ObservableObject {
     func createUserProfile(_ profile: UserProfile) async throws {
         // Create a properly encodable profile structure
         struct DatabaseProfile: Encodable {
+            let id: String
             let user_id: String
             let name: String
             let email: String
@@ -270,6 +276,7 @@ class SupabaseService: ObservableObject {
         }
         
         let dbProfile = DatabaseProfile(
+            id: profile.id,
             user_id: profile.id,
             name: profile.name,
             email: profile.email,
@@ -282,19 +289,125 @@ class SupabaseService: ObservableObject {
             .insert(dbProfile)
             .execute()
     }
+    
+    func signInWithGoogle(idToken: String) async throws -> (UserProfile, String) {
+        // Sign in with Google using the ID token
+        let authResult = try await client.auth.signInWithIdToken(
+            credentials: .init(provider: .google, idToken: idToken)
+        )
+        
+        await MainActor.run {
+            self.currentUser = authResult.user
+            self.isAuthenticated = true
+        }
+        
+        // Try to fetch existing profile first
+        do {
+            let profiles: [UserProfile] = try await client.database
+                .from("profiles")
+                .select()
+                .eq("user_id", value: authResult.user.id.uuidString)
+                .execute()
+                .value
+            
+            if let dbProfile = profiles.first {
+                // User exists - return existing profile
+                return (dbProfile, authResult.accessToken)
+            }
+        } catch {
+            // Profile not found, will create one below
+        }
+        
+        // User doesn't exist - create new profile using upsert
+        let profile = UserProfile(
+            id: authResult.user.id.uuidString,
+            email: authResult.user.email ?? "user@gmail.com",
+            name: authResult.user.userMetadata["full_name"] as? String ?? 
+                  authResult.user.userMetadata["name"] as? String ?? 
+                  authResult.user.email?.components(separatedBy: "@").first ?? "Google User",
+            skillLevel: "Beginner",
+            instruments: []
+        )
+        
+        // Use upsert to handle duplicate key gracefully
+        try await upsertUserProfile(profile)
+        
+        return (profile, authResult.accessToken)
+    }
+    
+    func upsertUserProfile(_ profile: UserProfile) async throws {
+        // Create a properly encodable profile structure
+        struct DatabaseProfile: Encodable {
+            let id: String
+            let user_id: String
+            let name: String
+            let email: String
+            let skill_level: String
+            let instruments: [String]
+        }
+        
+        let dbProfile = DatabaseProfile(
+            id: profile.id,
+            user_id: profile.id,
+            name: profile.name,
+            email: profile.email,
+            skill_level: profile.skillLevel,
+            instruments: profile.instruments
+        )
+        
+        // Use upsert (insert or update) to handle duplicates
+        try await client.database
+            .from("profiles")
+            .upsert(dbProfile)
+            .execute()
+    }
 }
 
 // MARK: - Backend Service
 class BackendService: ObservableObject {
     @Published var progressMessage = "Initializing analysis..."
+    @Published var progressPercentage: Double = 0.0
+    @Published var currentStep: Int = 0
+    @Published var totalSteps: Int = 6
+    
     private let supabaseService = SupabaseService.shared
+    
+    private let analysisSteps = [
+        "Preparing files for analysis...",
+        "Uploading audio to cloud storage...",
+        "Uploading sheet music to cloud storage...",
+        "Processing audio with AI...",
+        "Analyzing sheet music...",
+        "Comparing performance with reference...",
+        "Generating detailed feedback...",
+        "Analysis complete!"
+    ]
+    
+    private func updateProgress(step: Int, message: String? = nil) async {
+        await MainActor.run {
+            self.currentStep = step
+            self.progressPercentage = Double(step) / Double(totalSteps)
+            self.progressMessage = message ?? analysisSteps[min(step, analysisSteps.count - 1)]
+        }
+    }
+    
+    private func resetProgress() async {
+        await MainActor.run {
+            self.currentStep = 0
+            self.progressPercentage = 0.0
+            self.progressMessage = "Initializing analysis..."
+        }
+    }
     
     func analyzePerformance(audioURL: URL, sheetMusicURL: URL, userId: String, appState: AppState) async throws -> (authResult: AnalysisResult, audioURL: String, sheetMusicURL: String) {
         print("🎵 BackendService: Starting analysis...")
         
-        await MainActor.run {
-            progressMessage = "Uploading files to Supabase..."
-        }
+        // Reset progress at start
+        await resetProgress()
+        
+        // Step 1: Prepare files
+        await updateProgress(step: 1)
+        try await Task.sleep(nanoseconds: 500_000_000) // 0.5 second delay for better UX
         
         let audioData = try Data(contentsOf: audioURL)
         let sheetMusicData = try Data(contentsOf: sheetMusicURL)
@@ -302,7 +415,12 @@ class BackendService: ObservableObject {
         let audioFileName = "audio_\(UUID().uuidString).m4a"
         let sheetMusicFileName = "sheet_\(UUID().uuidString).pdf"
         
+        // Step 2: Upload audio
+        await updateProgress(step: 2)
         let audioPath = try await supabaseService.uploadFile(audioData, fileName: audioFileName, bucket: "user-audio")
+        
+        // Step 3: Upload sheet music
+        await updateProgress(step: 3)
         let sheetMusicPath = try await supabaseService.uploadFile(sheetMusicData, fileName: sheetMusicFileName, bucket: "user-sheet-music")
         
         // Get the public URLs for the uploaded files
@@ -311,15 +429,20 @@ class BackendService: ObservableObject {
             throw BackendError.networkError
         }
         
-        await MainActor.run {
-            progressMessage = "Analyzing performance..."
-        }
+        // Step 4: Process audio with AI
+        await updateProgress(step: 4)
+        try await Task.sleep(nanoseconds: 1_000_000_000) // 1 second delay for better UX
         
+        // Step 5: Analyze sheet music
+        await updateProgress(step: 5)
+        try await Task.sleep(nanoseconds: 1_000_000_000) // 1 second delay for better UX
+        
+        // Step 6: Compare and generate feedback
+        await updateProgress(step: 6)
         let authResult = try await callAnalyzeEndpoint(audioPath: audioURL.absoluteString, sheetMusicPath: sheetMusicURL.absoluteString)
         
-        await MainActor.run {
-            progressMessage = "Analysis complete!"
-        }
+        // Step 7: Complete
+        await updateProgress(step: 7)
         
         return (authResult: authResult, audioURL: audioPath, sheetMusicURL: sheetMusicPath)
     }
@@ -460,6 +583,9 @@ class DataManager: ObservableObject {
             do {
                 try await supabaseService.saveSession(session.toBackendSession())
                 print("✅ Practice session saved to Supabase")
+                
+                // Notify that a new session was saved
+                NotificationCenter.default.post(name: .newSessionSaved, object: nil)
             } catch {
                 print("❌ Failed to save practice session to Supabase: \(error)")
             }
@@ -633,6 +759,8 @@ struct PracticeSession: Codable, Identifiable {
     let timingFeedback: String
     let duration: TimeInterval
     let pieceTitle: String?
+    let allAudioNotes: [String]
+    let allSheetNotes: [String]
     
     enum CodingKeys: String, CodingKey {
         case id
@@ -648,6 +776,8 @@ struct PracticeSession: Codable, Identifiable {
         case timingFeedback = "timing_feedback"
         case duration
         case pieceTitle = "piece_title"
+        case allAudioNotes = "all_audio_notes"
+        case allSheetNotes = "all_sheet_notes"
     }
     
     init(userId: String, audioFileName: String, sheetMusicFileName: String, analysisResult: AnalysisResult, duration: TimeInterval, pieceTitle: String? = nil) {
@@ -664,6 +794,8 @@ struct PracticeSession: Codable, Identifiable {
         self.timingFeedback = analysisResult.rhythmicAnalysis.timingAnalysis
         self.duration = duration
         self.pieceTitle = pieceTitle
+        self.allAudioNotes = analysisResult.allAudioNotes
+        self.allSheetNotes = analysisResult.allSheetNotes
     }
     
     func toBackendSession() -> BackendSession {
@@ -684,7 +816,9 @@ struct PracticeSession: Codable, Identifiable {
             totalNotes: totalNotes,
             missedNotes: missedNotes,
             tempoFeedback: tempoFeedback,
-            timingFeedback: timingFeedback
+            timingFeedback: timingFeedback,
+            allAudioNotes: allAudioNotes,
+            allSheetNotes: allSheetNotes
         )
     }
 }
@@ -704,6 +838,8 @@ struct BackendSession: Codable, Identifiable {
     let missedNotes: [String]?
     let tempoFeedback: String?
     let timingFeedback: String?
+    let allAudioNotes: [String]?
+    let allSheetNotes: [String]?
     
     enum CodingKeys: String, CodingKey {
         case id
@@ -719,6 +855,8 @@ struct BackendSession: Codable, Identifiable {
         case missedNotes = "missed_notes"
         case tempoFeedback = "tempo_feedback"
         case timingFeedback = "timing_feedback"
+        case allAudioNotes = "all_audio_notes"
+        case allSheetNotes = "all_sheet_notes"
     }
     
     var createdAt: Date {
@@ -733,6 +871,10 @@ struct BackendSession: Codable, Identifiable {
         }
         
         let missedNotesArray = missedNotes ?? []
+        
+        // Use the actual stored note arrays, or create fallback if not available
+        let allAudioNotes = self.allAudioNotes ?? []
+        let allSheetNotes = self.allSheetNotes ?? []
         
         let rhythmicAnalysis = RhythmicAnalysis(
             tempoAccuracy: 0.0,
@@ -749,8 +891,8 @@ struct BackendSession: Codable, Identifiable {
             totalUserNotes: correctNotes,
             missedNotes: missedNotesArray,
             extraNotes: [],
-            allSheetNotes: [],
-            allAudioNotes: [],
+            allSheetNotes: allSheetNotes,
+            allAudioNotes: allAudioNotes,
             overallFeedback: "Historical session data",
             tips: [],
             rhythmicAnalysis: rhythmicAnalysis,
@@ -918,35 +1060,6 @@ class AppState: ObservableObject {
         print("🔄 Complete app state reset - ready for fresh test")
     }
     
-    func signInWithTestAccount() async {
-        print("🧪 Signing in with test account...")
-        
-        UserDefaults.standard.removeObject(forKey: "currentUserId")
-        
-        let testUserId = "test-user-\(UUID().uuidString.prefix(8))"
-        UserDefaults.standard.set(testUserId, forKey: "currentUserId")
-        self.currentUserId = testUserId
-        
-        self.supabaseAccessToken = "test-token-\(UUID().uuidString)"
-        
-        print("🆔 Generated test user ID: \(self.currentUserId)")
-        print("🔑 Set test access token: \(self.supabaseAccessToken.prefix(20))...")
-        
-        let testProfile = UserProfile(
-            id: currentUserId,
-            email: "test@graceai.com",
-            name: "Test User"
-        )
-        
-        saveUserProfile(testProfile)
-        
-        await MainActor.run {
-            self.currentScreen = .main
-            self.isLoggedIn = true
-        }
-        
-        print("✅ Test account signed in successfully!")
-    }
 }
 
 // MARK: - Main Content View
@@ -954,8 +1067,6 @@ struct ContentView: View {
     @StateObject private var appState = AppState()
     
     var body: some View {
-        let _ = print("🎨 ContentView body rendered")
-        let _ = print("📱 Current screen: \(appState.currentScreen)")
         Group {
             switch appState.currentScreen {
             case .splash:
@@ -1283,7 +1394,6 @@ struct LoginScreen: View {
                         }
                         
                         Button(action: {
-                            print("🔘 Auth button pressed!")
                             handleAuth()
                         }) {
                             HStack {
@@ -1334,12 +1444,26 @@ struct LoginScreen: View {
                                 .font(.subheadline)
                             
                             Button(action: {
-                                print("🔘 Google Sign-In button pressed!")
                                 signInWithGoogle()
                             }) {
                                 HStack {
-                                    Image(systemName: "globe")
-                                        .font(.title3)
+                                    // Google logo
+                                    AsyncImage(url: URL(string: "data:image/png;base64,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")) { image in
+                                        image
+                                            .resizable()
+                                            .aspectRatio(contentMode: .fit)
+                                            .frame(width: 24, height: 24)
+                                    } placeholder: {
+                                        // Fallback to simple G if image fails to load
+                                        ZStack {
+                                            Circle()
+                                                .fill(Color.white)
+                                                .frame(width: 24, height: 24)
+                                            Text("G")
+                                                .font(.system(size: 14, weight: .bold))
+                                                .foregroundColor(.blue)
+                                        }
+                                    }
                                     Text("Continue with Google")
                                         .fontWeight(.medium)
                                 }
@@ -1351,43 +1475,6 @@ struct LoginScreen: View {
                             }
                             .buttonStyle(PlainButtonStyle())
                             
-                            Button(action: {
-                                print("🧪 Test Account Sign-In button pressed!")
-                                Task {
-                                    await appState.signInWithTestAccount()
-                                }
-                            }) {
-                                HStack {
-                                    Image(systemName: "person.circle.fill")
-                                        .font(.title3)
-                                    Text("Sign in with Test Account")
-                                        .fontWeight(.medium)
-                                }
-                                .foregroundColor(.white)
-                                .frame(maxWidth: .infinity)
-                                .padding()
-                                .background(Color.purple)
-                                .cornerRadius(12)
-                            }
-                            .buttonStyle(PlainButtonStyle())
-                            
-                            Button(action: {
-                                print("🔄 Reset App State button pressed!")
-                                appState.resetAppState()
-                            }) {
-                                HStack {
-                                    Image(systemName: "arrow.clockwise.circle.fill")
-                                        .font(.title3)
-                                    Text("Reset App State")
-                                        .fontWeight(.medium)
-                                }
-                                .foregroundColor(.white)
-                                .frame(maxWidth: .infinity)
-                                .padding()
-                                .background(Color.red.opacity(0.8))
-                                .cornerRadius(12)
-                            }
-                            .buttonStyle(PlainButtonStyle())
                         }
                         .padding(.top, 20)
                     }
@@ -1410,8 +1497,6 @@ struct LoginScreen: View {
     }
     
     private func handleAuth() {
-        print("🔐 handleAuth() called")
-        
         if email.isEmpty || password.isEmpty {
             alertMessage = "❌ Please fill in all fields"
             showingAlert = true
@@ -1535,11 +1620,9 @@ struct LoginScreen: View {
     }
     
     private func signInWithGoogle() {
-        print("🔐 signInWithGoogle() called")
         isLoading = true
         
         if GIDSignIn.sharedInstance.configuration == nil {
-            print("❌ Google Sign-In not configured")
             isLoading = false
             alertMessage = "Google Sign-In not configured properly"
             showingAlert = true
@@ -1547,7 +1630,6 @@ struct LoginScreen: View {
         }
         
         guard let presentingViewController = (UIApplication.shared.connectedScenes.first as? UIWindowScene)?.windows.first?.rootViewController else { 
-            print("❌ Could not get presenting view controller")
             isLoading = false
             alertMessage = "Could not present Google Sign-In"
             showingAlert = true
@@ -1575,21 +1657,25 @@ struct LoginScreen: View {
                     return
                 }
                 
-                // Handle Google Sign-In success
+                // Handle Google Sign-In success with Supabase
+                do {
+                    let (profile, accessToken) = try await self.appState.supabaseService.signInWithGoogle(idToken: idToken)
+                    
                     await MainActor.run {
                         self.isLoading = false
-                    // Create a profile from Google user data
-                    let profile = UserProfile(
-                        id: user.userID ?? UUID().uuidString,
-                        email: user.profile?.email ?? "user@gmail.com",
-                        name: user.profile?.name ?? "Google User"
-                    )
-                    
                         self.appState.saveUserProfile(profile)
+                        self.appState.supabaseAccessToken = accessToken
                         self.appState.isLoggedIn = true
                         
                         withAnimation {
                             self.appState.currentScreen = .main
+                        }
+                    }
+                } catch {
+                    await MainActor.run {
+                        self.isLoading = false
+                        self.alertMessage = "Failed to sign in with Google: \(error.localizedDescription)"
+                        self.showingAlert = true
                     }
                 }
             }
@@ -2057,13 +2143,19 @@ struct QuickActionsSection: View {
                 Spacer()
             }
             
-            Button(action: { showingQuickPractice = true }) {
+            Button(action: {}) {
                 HStack {
                     Image(systemName: "play.fill")
                         .foregroundColor(.white)
-                    Text("Start Practice Session")
-                        .fontWeight(.semibold)
-                        .foregroundColor(.white)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Start Practice Session")
+                            .fontWeight(.semibold)
+                            .foregroundColor(.white)
+                        Text("(hold)")
+                            .font(.caption)
+                            .opacity(0.7)
+                            .foregroundColor(.white)
+                    }
                     Spacer()
                     Image(systemName: "arrow.right")
                         .foregroundColor(.white)
@@ -2073,6 +2165,9 @@ struct QuickActionsSection: View {
                 .cornerRadius(12)
                 .shadow(color: Color.purple.opacity(0.5), radius: 10, x: 0, y: 5)
             }
+            .buttonStyle(HoldToActivateQuickButtonStyle {
+                showingQuickPractice = true
+            })
         }
     }
 }
@@ -2090,6 +2185,21 @@ struct PracticeScreen: View {
     @State private var showingResults = false
     @State private var recentSessions: [BackendSession] = []
     @State private var isLoadingHistory = false
+    @State private var loadingTextIndex = 0
+    @State private var loadingTextTimer: Timer?
+    
+    private let loadingMessages = [
+        "Starting Analysis...",
+        "Uploading Audio File",
+        "Processing Audio Data",
+        "Extracting Musical Notes",
+        "Analyzing Sheet Music",
+        "Comparing Performance",
+        "Calculating Accuracy",
+        "Generating Feedback",
+        "Finalizing Results",
+        "Almost Complete..."
+    ]
     
     var body: some View {
         NavigationView {
@@ -2160,6 +2270,43 @@ struct PracticeScreen: View {
                         await loadRecentSessionsAsync()
                     }
                 }
+                
+                // Loading overlay
+                if isAnalyzing {
+                    Color.black.opacity(0.7)
+                        .ignoresSafeArea()
+                        .transition(.opacity)
+                    
+                    VStack(spacing: 20) {
+                        // Animated music note icon
+                        Image(systemName: "music.note.list")
+                            .font(.system(size: 60))
+                            .foregroundColor(.purple)
+                            .scaleEffect(1.0)
+                            .animation(
+                                .easeInOut(duration: 1.0)
+                                .repeatForever(autoreverses: true),
+                                value: isAnalyzing
+                            )
+                        
+                        Text(loadingMessages[loadingTextIndex])
+                            .font(.title2)
+                            .fontWeight(.bold)
+                            .foregroundColor(.white)
+                            .animation(.easeInOut(duration: 0.5), value: loadingTextIndex)
+                        
+                        Text("This may take a few moments...")
+                            .font(.subheadline)
+                            .foregroundColor(.white.opacity(0.8))
+                    }
+                    .padding(40)
+                    .background(
+                        RoundedRectangle(cornerRadius: 20)
+                            .fill(Color.black.opacity(0.8))
+                            .blur(radius: 10)
+                    )
+                    .transition(.scale.combined(with: .opacity))
+                }
             }
             .navigationTitle("")
             .navigationBarHidden(true)
@@ -2200,6 +2347,13 @@ struct PracticeScreen: View {
             print("🆔 Current user ID: \(appState.currentUserId)")
             print("🔐 Is authenticated: \(appState.isLoggedIn)")
             loadRecentSessions()
+        }
+        .onChange(of: isAnalyzing) { analyzing in
+            if analyzing {
+                startLoadingTextAnimation()
+            } else {
+                stopLoadingTextAnimation()
+            }
         }
     }
     
@@ -2276,7 +2430,189 @@ struct PracticeScreen: View {
             }
         }
     }
+    
+    private func startLoadingTextAnimation() {
+        loadingTextIndex = 0
+        loadingTextTimer = Timer.scheduledTimer(withTimeInterval: 2.5, repeats: true) { _ in
+            withAnimation(.easeInOut(duration: 0.8)) {
+                loadingTextIndex = (loadingTextIndex + 1) % loadingMessages.count
+            }
+        }
+    }
+    
+    private func stopLoadingTextAnimation() {
+        loadingTextTimer?.invalidate()
+        loadingTextTimer = nil
+        loadingTextIndex = 0
+    }
 }
+
+// MARK: - Custom Button Styles
+struct PressableButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.92 : 1.0)
+            .opacity(configuration.isPressed ? 0.7 : 1.0)
+            .brightness(configuration.isPressed ? -0.1 : 0.0)
+            .animation(.easeInOut(duration: 0.15), value: configuration.isPressed)
+            .onChange(of: configuration.isPressed) { isPressed in
+                if isPressed {
+                    // Add haptic feedback when button is pressed
+                    let impactFeedback = UIImpactFeedbackGenerator(style: .medium)
+                    impactFeedback.impactOccurred()
+                }
+            }
+    }
+}
+
+struct HoldToActivateButtonStyle: ButtonStyle {
+    @State private var holdProgress: Double = 0.0
+    @State private var holdTimer: Timer?
+    @State private var isHolding = false
+    
+    let holdDuration: Double = 2.0
+    let onActivated: () -> Void
+    
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.95 : 1.0)
+            .opacity(configuration.isPressed ? 0.8 : 1.0)
+            .animation(.easeInOut(duration: 0.1), value: configuration.isPressed)
+            .overlay(
+                // White fill that scales with the button
+                GeometryReader { geometry in
+                    HStack(spacing: 0) {
+                        RoundedRectangle(cornerRadius: 16) // Match the button's corner radius
+                            .fill(Color.white.opacity(0.3))
+                            .frame(width: geometry.size.width * holdProgress, height: geometry.size.height)
+                        
+                        Spacer()
+                    }
+                    .padding(.leading, 0) // No padding from left
+                    .opacity(isHolding ? 1.0 : 0.0)
+                    .animation(.linear(duration: 0.02), value: holdProgress)
+                    .scaleEffect(configuration.isPressed ? 0.95 : 1.0) // Scale with button
+                    .clipped() // Ensure it stays within bounds
+                }
+            )
+            .onChange(of: configuration.isPressed) { isPressed in
+                if isPressed {
+                    startHoldTimer()
+                } else {
+                    cancelHoldTimer()
+                }
+            }
+    }
+    
+    private func startHoldTimer() {
+        isHolding = true
+        holdProgress = 0.0
+        
+        // Add initial haptic feedback
+        let impactFeedback = UIImpactFeedbackGenerator(style: .light)
+        impactFeedback.impactOccurred()
+        
+        holdTimer = Timer.scheduledTimer(withTimeInterval: 0.02, repeats: true) { timer in
+            holdProgress += 0.02 / holdDuration
+            
+            if holdProgress >= 1.0 {
+                // Hold completed - activate
+                timer.invalidate()
+                holdTimer = nil
+                isHolding = false
+                holdProgress = 0.0
+                
+                // Success haptic feedback
+                let successFeedback = UIImpactFeedbackGenerator(style: .heavy)
+                successFeedback.impactOccurred()
+                
+                onActivated()
+            }
+        }
+    }
+    
+    private func cancelHoldTimer() {
+        holdTimer?.invalidate()
+        holdTimer = nil
+        isHolding = false
+        holdProgress = 0.0
+    }
+}
+
+struct HoldToActivateQuickButtonStyle: ButtonStyle {
+    @State private var holdProgress: Double = 0.0
+    @State private var holdTimer: Timer?
+    @State private var isHolding = false
+    
+    let holdDuration: Double = 2.0
+    let onActivated: () -> Void
+    
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.95 : 1.0)
+            .opacity(configuration.isPressed ? 0.8 : 1.0)
+            .animation(.easeInOut(duration: 0.1), value: configuration.isPressed)
+            .overlay(
+                // White fill that scales with the quick button
+                GeometryReader { geometry in
+                    HStack(spacing: 0) {
+                        RoundedRectangle(cornerRadius: 12) // Match the quick button's corner radius
+                            .fill(Color.white.opacity(0.3))
+                            .frame(width: geometry.size.width * holdProgress, height: geometry.size.height)
+                        
+                        Spacer()
+                    }
+                    .padding(.leading, 0) // No padding from left
+                    .opacity(isHolding ? 1.0 : 0.0)
+                    .animation(.linear(duration: 0.02), value: holdProgress)
+                    .scaleEffect(configuration.isPressed ? 0.95 : 1.0) // Scale with button
+                    .clipped() // Ensure it stays within bounds
+                }
+            )
+            .onChange(of: configuration.isPressed) { isPressed in
+                if isPressed {
+                    startHoldTimer()
+                } else {
+                    cancelHoldTimer()
+                }
+            }
+    }
+    
+    private func startHoldTimer() {
+        isHolding = true
+        holdProgress = 0.0
+        
+        // Add initial haptic feedback
+        let impactFeedback = UIImpactFeedbackGenerator(style: .light)
+        impactFeedback.impactOccurred()
+        
+        holdTimer = Timer.scheduledTimer(withTimeInterval: 0.02, repeats: true) { timer in
+            holdProgress += 0.02 / holdDuration
+            
+            if holdProgress >= 1.0 {
+                // Hold completed - activate
+                timer.invalidate()
+                holdTimer = nil
+                isHolding = false
+                holdProgress = 0.0
+                
+                // Success haptic feedback
+                let successFeedback = UIImpactFeedbackGenerator(style: .heavy)
+                successFeedback.impactOccurred()
+                
+                onActivated()
+            }
+        }
+    }
+    
+    private func cancelHoldTimer() {
+        holdTimer?.invalidate()
+        holdTimer = nil
+        isHolding = false
+        holdProgress = 0.0
+    }
+}
+
 
 // MARK: - Recording Section
 struct RecordingSection: View {
@@ -2285,6 +2621,8 @@ struct RecordingSection: View {
     @State private var recordingDuration: TimeInterval = 0
     @State private var recordingTimer: Timer?
     @State private var showingFilePicker = false
+    @State private var audioRecorder: AVAudioRecorder?
+    @State private var audioRecorderDelegate: AudioRecorderDelegate?
     
     var body: some View {
         VStack(spacing: 16) {
@@ -2314,6 +2652,9 @@ struct RecordingSection: View {
                         .foregroundColor(.white)
                     }
                     .onTapGesture {
+                        // Add haptic feedback
+                        let impactFeedback = UIImpactFeedbackGenerator(style: .medium)
+                        impactFeedback.impactOccurred()
                         toggleRecording()
                     }
                     
@@ -2346,6 +2687,7 @@ struct RecordingSection: View {
                             .cornerRadius(12)
                             .shadow(color: .blue.opacity(0.5), radius: 10, x: 0, y: 5)
                 }
+                .buttonStyle(PressableButtonStyle())
                 
                 if selectedAudioURL != nil {
                     HStack {
@@ -2386,10 +2728,60 @@ struct RecordingSection: View {
     }
     
     private func startRecording() {
-            isRecording = true
-            recordingDuration = 0
-        recordingTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
-            recordingDuration += 0.1
+        // Request microphone permission
+        AVAudioSession.sharedInstance().requestRecordPermission { granted in
+            DispatchQueue.main.async {
+                if granted {
+                    self.setupAudioRecorder()
+                    self.isRecording = true
+                    self.recordingDuration = 0
+                    self.recordingTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
+                        self.recordingDuration += 0.1
+                    }
+                } else {
+                    // Handle permission denied
+                    print("Microphone permission denied")
+                }
+            }
+        }
+    }
+    
+    private func setupAudioRecorder() {
+        let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let audioFilename = documentsPath.appendingPathComponent("recorded_audio_\(Date().timeIntervalSince1970).m4a")
+        
+        let settings = [
+            AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
+            AVSampleRateKey: 44100,
+            AVNumberOfChannelsKey: 1,
+            AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue,
+            AVEncoderBitRateKey: 128000
+        ]
+        
+        do {
+            // Ensure audio session is properly configured
+            let audioSession = AVAudioSession.sharedInstance()
+            try audioSession.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetooth])
+            try audioSession.setActive(true)
+            
+            audioRecorderDelegate = AudioRecorderDelegate()
+            audioRecorderDelegate?.onRecordingFinished = { url in
+                DispatchQueue.main.async {
+                    selectedAudioURL = url
+                }
+            }
+            
+            audioRecorder = try AVAudioRecorder(url: audioFilename, settings: settings)
+            audioRecorder?.delegate = audioRecorderDelegate
+            audioRecorder?.prepareToRecord()
+            audioRecorder?.record()
+            
+            print("✅ Audio recorder started successfully")
+        } catch {
+            print("❌ Failed to setup audio recorder: \(error)")
+            DispatchQueue.main.async {
+                self.isRecording = false
+            }
         }
     }
     
@@ -2398,18 +2790,28 @@ struct RecordingSection: View {
         recordingTimer?.invalidate()
         recordingTimer = nil
         
-        // Here you would typically save the recorded audio
-        // For now, we'll create a mock URL
-        if let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
-            let audioURL = documentsPath.appendingPathComponent("recorded_audio_\(Date().timeIntervalSince1970).m4a")
-            selectedAudioURL = audioURL
-        }
+        audioRecorder?.stop()
+        selectedAudioURL = audioRecorder?.url
+        audioRecorder = nil
     }
     
     private func formatDuration(_ duration: TimeInterval) -> String {
         let minutes = Int(duration) / 60
         let seconds = Int(duration) % 60
         return String(format: "%02d:%02d", minutes, seconds)
+    }
+}
+
+// MARK: - Audio Recorder Delegate
+class AudioRecorderDelegate: NSObject, AVAudioRecorderDelegate {
+    var onRecordingFinished: ((URL?) -> Void)?
+    
+    func audioRecorderDidFinishRecording(_ recorder: AVAudioRecorder, successfully flag: Bool) {
+        if flag {
+            onRecordingFinished?(recorder.url)
+        } else {
+            onRecordingFinished?(nil)
+        }
     }
 }
 
@@ -2454,6 +2856,7 @@ struct SheetMusicSection: View {
                     .cornerRadius(12)
                     .shadow(color: .blue.opacity(0.5), radius: 10, x: 0, y: 5)
                 }
+                .buttonStyle(PressableButtonStyle())
                 
                 if selectedSheetMusicURL != nil {
                     HStack {
@@ -2544,10 +2947,8 @@ struct AnalysisButton: View {
     
     var body: some View {
         VStack(spacing: 12) {
-            Button(action: {
-                performAnalysis()
-            }) {
-                HStack {
+            Button(action: {}) {
+                HStack(spacing: 12) {
                     if isAnalyzing {
                         ProgressView()
                             .progressViewStyle(CircularProgressViewStyle(tint: .white))
@@ -2555,24 +2956,93 @@ struct AnalysisButton: View {
                     } else {
                         Image(systemName: "wand.and.stars")
                             .font(.title2)
+                            .foregroundColor(.white)
                     }
-                    Text(isAnalyzing ? "Analyzing..." : "Analyze Performance")
-                        .font(.headline)
+                    
+                    VStack(alignment: .center, spacing: 2) {
+                        Text(isAnalyzing ? "Analyzing..." : "Analyze Performance")
+                            .font(.headline)
+                            .fontWeight(.semibold)
+                        
+                        if !isAnalyzing {
+                            Text("(hold)")
+                                .font(.caption)
+                                .opacity(0.7)
+                        } else if isAnalyzing {
+                            Text("Please wait while we process your performance")
+                                .font(.caption)
+                                .opacity(0.8)
+                        }
+                    }
                 }
-                .foregroundColor(.white)
-                .padding()
                 .frame(maxWidth: .infinity)
-                .background(isAnalyzing ? Color.gray : Color.purple)
-                .cornerRadius(12)
-                .shadow(color: Color.purple.opacity(0.5), radius: 10, x: 0, y: 5)
+                .foregroundColor(.white)
+                .padding(.horizontal, 20)
+                .padding(.vertical, 16)
+                .frame(maxWidth: .infinity)
+                .background(
+                    LinearGradient(
+                        gradient: Gradient(colors: isAnalyzing ? 
+                            [Color.gray.opacity(0.8), Color.gray.opacity(0.6)] : 
+                            [Color.purple, Color.purple.opacity(0.8)]
+                        ),
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .cornerRadius(16)
+                .shadow(
+                    color: isAnalyzing ? Color.gray.opacity(0.3) : Color.purple.opacity(0.5), 
+                    radius: isAnalyzing ? 5 : 10, 
+                    x: 0, 
+                    y: isAnalyzing ? 2 : 5
+                )
+                .scaleEffect(isAnalyzing ? 0.98 : 1.0)
+                .animation(.easeInOut(duration: 0.2), value: isAnalyzing)
             }
+            .buttonStyle(HoldToActivateButtonStyle {
+                performAnalysis()
+            })
             .disabled(isAnalyzing)
             
             if isAnalyzing {
-                Text(backendService.progressMessage)
-                    .font(.caption)
-                    .foregroundColor(.white.opacity(0.7))
-                    .multilineTextAlignment(.center)
+                VStack(spacing: 12) {
+                    // Progress bar
+                    ProgressView(value: backendService.progressPercentage)
+                        .progressViewStyle(LinearProgressViewStyle(tint: .purple))
+                        .scaleEffect(x: 1, y: 2, anchor: .center)
+                        .animation(.easeInOut(duration: 0.3), value: backendService.progressPercentage)
+                    
+                    // Progress text with step indicator
+                    VStack(spacing: 4) {
+                        Text(backendService.progressMessage)
+                            .font(.subheadline)
+                            .fontWeight(.medium)
+                            .foregroundColor(.white)
+                            .multilineTextAlignment(.center)
+                        
+                        Text("Step \(backendService.currentStep) of \(backendService.totalSteps)")
+                            .font(.caption)
+                            .foregroundColor(.white.opacity(0.6))
+                    }
+                    
+                    // Animated loading dots
+                    HStack(spacing: 4) {
+                        ForEach(0..<3, id: \.self) { index in
+                            Circle()
+                                .fill(Color.purple)
+                                .frame(width: 6, height: 6)
+                                .scaleEffect(backendService.currentStep % 3 == index ? 1.2 : 0.8)
+                                .animation(
+                                    .easeInOut(duration: 0.6)
+                                    .repeatForever(autoreverses: true)
+                                    .delay(Double(index) * 0.2),
+                                    value: backendService.currentStep
+                                )
+                        }
+                    }
+                }
+                .padding(.top, 8)
             }
         }
         .alert("Analysis Error", isPresented: $showingError) {
@@ -2614,7 +3084,9 @@ struct AnalysisButton: View {
                                 totalNotes: authResult.totalNotes,
                                 missedNotes: authResult.missedNotes,
                                 tempoFeedback: authResult.rhythmicAnalysis.rhythmicFeedback,
-                                timingFeedback: authResult.rhythmicAnalysis.timingAnalysis
+                                timingFeedback: authResult.rhythmicAnalysis.timingAnalysis,
+                                allAudioNotes: authResult.allAudioNotes,
+                                allSheetNotes: authResult.allSheetNotes
                             )
                             
                             try await SupabaseService.shared.saveSession(session)
@@ -3138,6 +3610,7 @@ struct HistoryScreen: View {
     @ObservedObject var appState: AppState
     @State private var selectedTimeframe = "Week"
     @State private var sessions: [BackendSession] = []
+    @State private var lastRefreshTime = Date()
     @State private var isLoading = false
     @State private var selectedSession: BackendSession?
     @State private var showingSessionDetail = false
@@ -3171,6 +3644,20 @@ struct HistoryScreen: View {
             print("🔄 HistoryScreen appeared - loading sessions")
             print("🆔 Current user ID: \(appState.currentUserId)")
             print("🔐 Is authenticated: \(appState.isLoggedIn)")
+            loadSessionsForTimeframe(selectedTimeframe)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+            // Refresh when app becomes active (user returns from background or other apps)
+            let now = Date()
+            if now.timeIntervalSince(lastRefreshTime) > 5.0 { // Only refresh if more than 5 seconds have passed
+                print("🔄 App became active, refreshing history sessions")
+                lastRefreshTime = now
+                loadSessionsForTimeframe(selectedTimeframe)
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .newSessionSaved)) { _ in
+            // Refresh when a new session is saved
+            print("🔄 New session saved, refreshing history")
             loadSessionsForTimeframe(selectedTimeframe)
         }
     }
@@ -3610,11 +4097,10 @@ struct ChartView: View {
         let minAccuracy = 0.0
         
         let sortedSessions = sessions.sorted { session1, session2 in
-            let formatter = DateFormatter()
-            formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+            let formatter = DateFormatter.iso8601
             let date1 = formatter.date(from: session1.date) ?? Date.distantPast
             let date2 = formatter.date(from: session2.date) ?? Date.distantPast
-            return date1 < date2
+            return date1 < date2  // Ascending order: oldest on left, newest on right
         }
         
         let dataPoints = sortedSessions.enumerated().compactMap { index, session -> CGPoint? in
@@ -4093,7 +4579,25 @@ struct QuickPracticeScreen: View {
     @Environment(\.dismiss) private var dismiss
     @State private var isRecording = false
     @State private var selectedSheetMusicURL: URL?
-    @State private var showingFilePicker = false
+    @State private var selectedAudioURL: URL?
+    @State private var recordingDuration: TimeInterval = 0
+    @State private var recordingTimer: Timer?
+    @State private var audioRecorder: AVAudioRecorder?
+    @State private var audioRecorderDelegate: AudioRecorderDelegate?
+    @State private var savedFilename: String?
+    @State private var showingShareSheet = false
+    @State private var shareURL: URL?
+    
+    private func setupAudioSession() {
+        do {
+            let audioSession = AVAudioSession.sharedInstance()
+            try audioSession.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetooth])
+            try audioSession.setActive(true)
+            print("✅ Audio session configured for recording")
+        } catch {
+            print("❌ Failed to setup audio session: \(error)")
+        }
+    }
     
     var body: some View {
         NavigationView {
@@ -4119,25 +4623,110 @@ struct QuickPracticeScreen: View {
                     .padding(.top, 40)
                     
                     VStack(spacing: 20) {
-                        Button(action: {
-                            if isRecording {
-                                stopRecording()
-                            } else {
-                                startRecording()
-                            }
-                        }) {
-                            HStack {
+                        // Recording button
+                        VStack(spacing: 12) {
+                            ZStack {
+                                Circle()
+                                    .stroke(Color.white.opacity(0.3), lineWidth: 4)
+                                    .frame(width: 120, height: 120)
+                                
+                                Circle()
+                                    .fill(isRecording ? Color.red : Color.purple.opacity(0.3))
+                                    .frame(width: 100, height: 100)
+                                
                                 Image(systemName: isRecording ? "stop.fill" : "mic.fill")
-                                    .font(.title2)
-                                Text(isRecording ? "Stop Recording" : "Start Recording")
-                                    .font(.headline)
+                                    .font(.title)
+                                    .foregroundColor(.white)
                             }
-                            .foregroundColor(.white)
-                            .padding()
-                            .frame(maxWidth: .infinity)
-                            .background(isRecording ? Color.red : Color.green)
-                            .cornerRadius(12)
-                            .shadow(color: isRecording ? Color.red.opacity(0.5) : Color.green.opacity(0.5), radius: 10, x: 0, y: 5)
+                            .onTapGesture {
+                                print("🎤 Quick Practice recording button tapped!")
+                                // Add haptic feedback
+                                let impactFeedback = UIImpactFeedbackGenerator(style: .medium)
+                                impactFeedback.impactOccurred()
+                                toggleRecording()
+                            }
+                            
+                            Text(isRecording ? "Tap to Stop" : "Tap to Record")
+                                .font(.subheadline)
+                                .foregroundColor(.white)
+                            
+                            if isRecording {
+                                Text(formatDuration(recordingDuration))
+                                    .font(.title2)
+                                    .fontWeight(.bold)
+                                    .foregroundColor(.red)
+                            }
+                        }
+                        
+                        if selectedAudioURL != nil {
+                            VStack(spacing: 12) {
+                                HStack {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .foregroundColor(.green)
+                                    Text("Audio file selected")
+                                        .foregroundColor(.white)
+                                    Spacer()
+                                }
+                                
+                                Button(action: saveToFiles) {
+                                    HStack {
+                                        Image(systemName: "square.and.arrow.up.fill")
+                                            .font(.title2)
+                                        Text("Download / Share")
+                                            .font(.headline)
+                                    }
+                                    .foregroundColor(.white)
+                                    .padding()
+                                    .frame(maxWidth: .infinity)
+                                    .background(Color.blue)
+                                    .cornerRadius(12)
+                                    .shadow(color: .blue.opacity(0.5), radius: 10, x: 0, y: 5)
+                                }
+                                .buttonStyle(PressableButtonStyle())
+                                
+                                if let filename = savedFilename {
+                                    VStack(spacing: 8) {
+                                        HStack {
+                                            Image(systemName: "info.circle.fill")
+                                                .foregroundColor(.blue)
+                                            Text("File ready to save:")
+                                                .font(.subheadline)
+                                                .foregroundColor(.white.opacity(0.8))
+                                            Spacer()
+                                        }
+                                        
+                                        Text(filename)
+                                            .font(.caption)
+                                            .foregroundColor(.white)
+                                            .padding(.horizontal, 12)
+                                            .padding(.vertical, 6)
+                                            .background(Color.white.opacity(0.1))
+                                            .cornerRadius(8)
+                                        
+                                        VStack(spacing: 4) {
+                                            HStack {
+                                                Image(systemName: "square.and.arrow.up")
+                                                    .foregroundColor(.blue)
+                                                Text("Ready to download:")
+                                                    .font(.caption)
+                                                    .foregroundColor(.white.opacity(0.7))
+                                                Spacer()
+                                            }
+                                            
+                                            Text("✅ Tap 'Download / Share' above")
+                                                .font(.caption2)
+                                                .foregroundColor(.green)
+                                            Text("📱 Choose 'Save to Files' to download")
+                                                .font(.caption2)
+                                                .foregroundColor(.white.opacity(0.6))
+                                            Text("💾 Or share with other apps")
+                                                .font(.caption2)
+                                                .foregroundColor(.white.opacity(0.6))
+                                        }
+                                        .padding(.top, 4)
+                                    }
+                                }
+                            }
                         }
                         
                         if selectedSheetMusicURL != nil {
@@ -4169,16 +4758,157 @@ struct QuickPracticeScreen: View {
                 }
             }
         }
+        .sheet(isPresented: $showingShareSheet) {
+            if let shareURL = shareURL {
+                ShareSheet(items: [shareURL])
+            }
+        }
+    }
+    
+    private func toggleRecording() {
+        if isRecording {
+            stopRecording()
+        } else {
+            startRecording()
+        }
     }
     
     private func startRecording() {
-        isRecording = true
-        // Add recording logic here
+        // Request microphone permission
+        AVAudioSession.sharedInstance().requestRecordPermission { granted in
+            DispatchQueue.main.async {
+                if granted {
+                    self.setupAudioRecorder()
+                    self.isRecording = true
+                    self.recordingDuration = 0
+                    self.recordingTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
+                        self.recordingDuration += 0.1
+                    }
+                } else {
+                    // Handle permission denied
+                    print("Microphone permission denied")
+                }
+            }
+        }
+    }
+    
+    private func setupAudioRecorder() {
+        let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let audioFilename = documentsPath.appendingPathComponent("recorded_audio_\(Date().timeIntervalSince1970).m4a")
+        
+        let settings = [
+            AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
+            AVSampleRateKey: 44100,
+            AVNumberOfChannelsKey: 1,
+            AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue,
+            AVEncoderBitRateKey: 128000
+        ]
+        
+        do {
+            // Ensure audio session is properly configured
+            let audioSession = AVAudioSession.sharedInstance()
+            try audioSession.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetooth])
+            try audioSession.setActive(true)
+            
+            audioRecorderDelegate = AudioRecorderDelegate()
+            audioRecorderDelegate?.onRecordingFinished = { url in
+                DispatchQueue.main.async {
+                    selectedAudioURL = url
+                }
+            }
+            
+            audioRecorder = try AVAudioRecorder(url: audioFilename, settings: settings)
+            audioRecorder?.delegate = audioRecorderDelegate
+            audioRecorder?.prepareToRecord()
+            audioRecorder?.record()
+            
+            print("✅ Audio recorder started successfully")
+        } catch {
+            print("❌ Failed to setup audio recorder: \(error)")
+            DispatchQueue.main.async {
+                self.isRecording = false
+            }
+        }
     }
     
     private func stopRecording() {
         isRecording = false
-        // Add stop recording logic here
+        recordingTimer?.invalidate()
+        recordingTimer = nil
+        
+        audioRecorder?.stop()
+        selectedAudioURL = audioRecorder?.url
+        audioRecorder = nil
+    }
+    
+    private func formatDuration(_ duration: TimeInterval) -> String {
+        let minutes = Int(duration) / 60
+        let seconds = Int(duration) % 60
+        return String(format: "%02d:%02d", minutes, seconds)
+    }
+    
+    private func saveToFiles() {
+        guard let audioURL = selectedAudioURL else { 
+            print("❌ No audio URL available to save")
+            return 
+        }
+        
+        // Generate a timestamped filename
+        let timestamp = Date().timeIntervalSince1970
+        let filename = "quick_practice_\(Int(timestamp)).m4a"
+        
+        do {
+            // Create a temporary file with the proper filename for sharing
+            let tempDirectory = FileManager.default.temporaryDirectory
+            let tempURL = tempDirectory.appendingPathComponent(filename)
+            
+            // Copy the audio file to temporary location with proper filename
+            if FileManager.default.fileExists(atPath: tempURL.path) {
+                try FileManager.default.removeItem(at: tempURL)
+            }
+            try FileManager.default.copyItem(at: audioURL, to: tempURL)
+            
+            // Set the filename for display
+            savedFilename = filename
+            shareURL = tempURL
+            
+            // Trigger the share sheet
+            showingShareSheet = true
+            
+            print("✅ Audio file ready for download/share: \(filename)")
+            print("📁 Temporary location: \(tempURL.path)")
+            
+        } catch {
+            print("❌ Failed to prepare file for sharing: \(error)")
+        }
+    }
+    
+    private func saveToSharedDocuments(audioURL: URL, filename: String) {
+        do {
+            // Get Documents directory that can be shared
+            let documentsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            let destinationURL = documentsURL.appendingPathComponent(filename)
+            
+            // Copy the audio file to Documents directory
+            if FileManager.default.fileExists(atPath: destinationURL.path) {
+                try FileManager.default.removeItem(at: destinationURL)
+            }
+            try FileManager.default.copyItem(at: audioURL, to: destinationURL)
+            
+            // Set the filename for display
+            savedFilename = filename
+            
+            print("✅ Audio file saved to Documents: \(filename)")
+            print("📁 Documents location: \(destinationURL.path)")
+            print("💡 File can be accessed via Files app > On My iPhone > GraceAI > Documents")
+            
+        } catch {
+            print("❌ Failed to save to Documents: \(error)")
+        }
+    }
+    
+    private func saveToLocalDocuments(audioURL: URL, filename: String) {
+        saveToSharedDocuments(audioURL: audioURL, filename: filename)
     }
 }
 
@@ -4808,6 +5538,7 @@ struct EnhancedPerformanceStatCard: View {
                 }
             }
             .frame(height: 4)
+            .clipped()
         }
         .frame(maxWidth: .infinity)
         .padding()
@@ -5215,9 +5946,23 @@ struct SupabaseSession: Codable {
             totalNotes: total_notes,
             missedNotes: missed_notes,
             tempoFeedback: tempo_feedback,
-            timingFeedback: timing_feedback
+            timingFeedback: timing_feedback,
+            allAudioNotes: nil,
+            allSheetNotes: nil
         )
     }
+}
+
+// MARK: - Share Sheet
+struct ShareSheet: UIViewControllerRepresentable {
+    let items: [Any]
+    
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        let controller = UIActivityViewController(activityItems: items, applicationActivities: nil)
+        return controller
+    }
+    
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
 
 // MARK: - End of File (Duplicates removed)
