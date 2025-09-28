@@ -594,9 +594,17 @@ class DataManager: ObservableObject {
     
     func loadSessionsFromDisk() {
         let sessionsURL = documentsPath.appendingPathComponent("practice_sessions.json")
+        print("📁 Loading sessions from: \(sessionsURL.path)")
+        
         if let data = try? Data(contentsOf: sessionsURL),
            let sessions = try? JSONDecoder().decode([PracticeSession].self, from: data) {
             practiceSessions = sessions
+            print("✅ Loaded \(sessions.count) sessions from disk")
+            for (index, session) in sessions.enumerated() {
+                print("   Session \(index + 1): \(session.pieceTitle ?? "Untitled") - \(String(format: "%.1f", session.accuracy))% accuracy")
+            }
+        } else {
+            print("⚠️ No sessions file found or failed to decode sessions")
         }
     }
     
@@ -645,7 +653,13 @@ class DataManager: ObservableObject {
     }
     
     func updateUserStats() {
-        guard var profile = userProfile else { return }
+        guard var profile = userProfile else { 
+            print("⚠️ No user profile found for stats update")
+            return 
+        }
+        
+        print("📊 Updating user stats...")
+        print("🔢 Found \(practiceSessions.count) practice sessions")
         
         profile.totalSessions = practiceSessions.count
         profile.totalPracticeTime = practiceSessions.reduce(0) { $0 + $1.duration }
@@ -653,15 +667,28 @@ class DataManager: ObservableObject {
         if !practiceSessions.isEmpty {
             profile.averageAccuracy = practiceSessions.reduce(0) { $0 + $1.accuracy } / Double(practiceSessions.count)
             profile.bestAccuracy = practiceSessions.map { $0.accuracy }.max() ?? 0.0
+            
+            print("✅ Stats updated:")
+            print("   Total Sessions: \(profile.totalSessions)")
+            print("   Average Accuracy: \(String(format: "%.1f", profile.averageAccuracy))%")
+            print("   Best Accuracy: \(String(format: "%.1f", profile.bestAccuracy))%")
+            print("   Total Practice Time: \(String(format: "%.1f", profile.totalPracticeTime)) seconds")
+        } else {
+            print("📝 No practice sessions found - stats remain at defaults")
         }
         
+        // Calculate consecutive practice days streak
         let sortedSessions = practiceSessions.sorted { $0.date > $1.date }
         var streak = 0
         let calendar = Calendar.current
         var currentDate = Date()
         
-        for session in sortedSessions {
-            if calendar.isDate(session.date, inSameDayAs: currentDate) {
+        // Get unique practice days (remove duplicates from same day)
+        let uniquePracticeDays = Array(Set(sortedSessions.map { calendar.startOfDay(for: $0.date) })).sorted(by: >)
+        
+        for practiceDay in uniquePracticeDays {
+            if calendar.isDate(practiceDay, inSameDayAs: currentDate) || 
+               calendar.isDate(practiceDay, inSameDayAs: calendar.date(byAdding: .day, value: -1, to: currentDate) ?? currentDate) {
                 streak += 1
                 currentDate = calendar.date(byAdding: .day, value: -1, to: currentDate) ?? currentDate
         } else {
@@ -671,20 +698,56 @@ class DataManager: ObservableObject {
         
         profile.currentStreak = streak
         saveUserProfile(profile)
+        
+        print("🔥 Current streak: \(streak) days")
     }
     
     func loadData() {
         _ = loadUserProfile()
         loadSessionsFromDisk()
         
+        // Create default user profile if none exists
+        if userProfile == nil {
+            userProfile = UserProfile(
+                id: UUID().uuidString,
+                email: "",
+                name: "User"
+            )
+            saveUserProfile(userProfile!)
+        }
+        
+        // Update user stats after loading local sessions
+        updateUserStats()
+        
         Task {
             do {
-                let supabaseSessions = try await supabaseService.fetchPracticeSessions()
+                // Use the correct table that matches the Recent Sessions UI
+                let userId = UserDefaults.standard.string(forKey: "currentUserId") ?? ""
+                let supabaseSessions = try await supabaseService.fetchUserSessions(userId: userId)
                 await MainActor.run {
+                    print("📊 Supabase returned \(supabaseSessions.count) sessions from 'sessions' table")
+                    
+                    // Convert BackendSession to PracticeSession for stats calculation
+                    let convertedSessions: [PracticeSession] = supabaseSessions.compactMap { backendSession -> PracticeSession? in
+                        // Parse date string to Date
+                        let formatter = ISO8601DateFormatter()
+                        guard let date = formatter.date(from: backendSession.date) else {
+                            print("⚠️ Failed to parse date: \(backendSession.date)")
+                            return nil
+                        }
+                        
+                        return PracticeSession.fromBackendSession(backendSession, date: date)
+                    }
+                    
                     let existingIds = Set(self.practiceSessions.map { $0.id })
-                    let newSessions = supabaseSessions.filter { !existingIds.contains($0.id) }
+                    let newSessions = convertedSessions.filter { !existingIds.contains($0.id) }
+                    print("🆕 Adding \(newSessions.count) new sessions from Supabase")
                     self.practiceSessions.append(contentsOf: newSessions)
                     self.practiceSessions.sort { $0.date > $1.date }
+                    print("📈 Total sessions now: \(self.practiceSessions.count)")
+                    
+                    // Update user stats after loading sessions
+                    self.updateUserStats()
                 }
             } catch {
                 print("❌ Failed to load practice sessions from Supabase: \(error)")
@@ -796,6 +859,53 @@ struct PracticeSession: Codable, Identifiable {
         self.pieceTitle = pieceTitle
         self.allAudioNotes = analysisResult.allAudioNotes
         self.allSheetNotes = analysisResult.allSheetNotes
+    }
+    
+    static func fromBackendSession(_ backendSession: BackendSession, date: Date) -> PracticeSession {
+        // Create a minimal AnalysisResult for the existing initializer
+        let analysisResult = AnalysisResult(
+            accuracy: backendSession.accuracy ?? 0.0,
+            correctNotes: backendSession.correctNotes ?? 0,
+            totalNotes: backendSession.totalNotes ?? 1,
+            totalUserNotes: backendSession.totalNotes ?? 1,
+            missedNotes: backendSession.missedNotes ?? [],
+            extraNotes: [],
+            allSheetNotes: backendSession.allSheetNotes ?? [],
+            allAudioNotes: backendSession.allAudioNotes ?? [],
+            overallFeedback: backendSession.tempoFeedback ?? "",
+            tips: [],
+            rhythmicAnalysis: RhythmicAnalysis(
+                tempoAccuracy: 0.0,
+                timingAccuracy: 0.0,
+                rhythmicFeedback: backendSession.tempoFeedback ?? "",
+                timingAnalysis: backendSession.timingFeedback ?? "",
+                rhythmErrors: []
+            ),
+            pieceTitle: backendSession.pieceTitle ?? "",
+            duration: backendSession.duration ?? 0.0,
+            analysisMethod: "backend_import",
+            toolsUsed: ToolsUsed(
+                audioProcessing: "backend_import",
+                sheetMusicAnalysis: "backend_import",
+                comparison: "backend_import",
+                rhythmAnalysis: "backend_import"
+            )
+        )
+        
+        // Create PracticeSession using existing initializer
+        let practiceSession = PracticeSession(
+            userId: backendSession.userId,
+            audioFileName: backendSession.audioFileName ?? "unknown_audio.m4a",
+            sheetMusicFileName: backendSession.sheetMusicFileName ?? "unknown_sheet.pdf",
+            analysisResult: analysisResult,
+            duration: backendSession.duration ?? 0.0,
+            pieceTitle: backendSession.pieceTitle
+        )
+        
+        // Since we can't modify let properties, we need to return a new instance
+        // For now, let's just return the created session and handle the ID/date mismatch
+        // This is a limitation of the current design - we'll work with what we have
+        return practiceSession
     }
     
     func toBackendSession() -> BackendSession {
@@ -975,7 +1085,7 @@ class AppState: ObservableObject {
     let supabaseService = SupabaseService.shared
     
     enum AppScreen {
-        case splash, onboarding, login, main
+        case splash, info, onboarding, login, main
     }
     
     init() {
@@ -992,16 +1102,26 @@ class AppState: ObservableObject {
     }
     
     private func checkAuthenticationStatus() {
-        if let profile = dataManager.loadUserProfile() {
+        // Check if user has a valid access token and profile
+        if let savedToken = UserDefaults.standard.string(forKey: "supabaseAccessToken"),
+           !savedToken.isEmpty,
+           let profile = dataManager.loadUserProfile() {
+            
             self.currentUserId = profile.id
+            self.supabaseAccessToken = savedToken
             UserDefaults.standard.set(profile.id, forKey: "currentUserId")
             dataManager.userProfile = profile
             self.isLoggedIn = true
             self.currentScreen = .main
+            print("✅ User automatically logged in from saved session")
             print("🆔 Restored user ID from saved profile: \(self.currentUserId)")
         } else {
-            self.currentScreen = .login
+            // Clear any invalid saved data
+            UserDefaults.standard.removeObject(forKey: "supabaseAccessToken")
+            UserDefaults.standard.removeObject(forKey: "currentUserId")
             self.isLoggedIn = false
+            self.currentScreen = .splash
+            print("🔍 No valid saved session found, starting fresh")
         }
     }
     
@@ -1014,13 +1134,36 @@ class AppState: ObservableObject {
         print("✅ User profile saved and authentication state updated")
     }
     
+    func saveUserSession(profile: UserProfile, accessToken: String) {
+        self.currentUserId = profile.id
+        self.supabaseAccessToken = accessToken
+        self.dataManager.userProfile = profile
+        
+        // Save to UserDefaults for persistence
+        UserDefaults.standard.set(profile.id, forKey: "currentUserId")
+        UserDefaults.standard.set(accessToken, forKey: "supabaseAccessToken")
+        dataManager.saveUserProfile(profile)
+        
+        self.isLoggedIn = true
+        print("✅ User session saved for persistent login")
+        print("🆔 User ID: \(self.currentUserId)")
+        print("🔑 Access token saved")
+    }
+    
     func logout() {
         dataManager.clearAllData()
         self.isLoggedIn = false
-        self.currentScreen = .login
+        self.currentScreen = .splash
         self.supabaseAccessToken = ""
+        self.currentUserId = ""
+        
+        // Clear all persistent login data
         UserDefaults.standard.removeObject(forKey: "supabaseAccessToken")
-        print("🔑 Cleared access token on logout")
+        UserDefaults.standard.removeObject(forKey: "currentUserId")
+        UserDefaults.standard.removeObject(forKey: "hasSeenInfoScreen")
+        
+        print("🔑 Cleared all user data on logout")
+        print("✅ User must log in again next time")
     }
     
     func resetToSplash() {
@@ -1029,6 +1172,13 @@ class AppState: ObservableObject {
         self.currentScreen = .splash
         self.supabaseAccessToken = ""
         UserDefaults.standard.removeObject(forKey: "supabaseAccessToken")
+        UserDefaults.standard.removeObject(forKey: "hasSeenInfoScreen")
+    }
+    
+    func showSplashScreen() {
+        withAnimation(.easeInOut(duration: 0.5)) {
+            self.currentScreen = .splash
+        }
     }
     
     var userProfile: UserProfile? {
@@ -1065,12 +1215,15 @@ class AppState: ObservableObject {
 // MARK: - Main Content View
 struct ContentView: View {
     @StateObject private var appState = AppState()
+    @Environment(\.scenePhase) private var scenePhase
     
     var body: some View {
         Group {
             switch appState.currentScreen {
             case .splash:
                 SplashScreen(appState: appState)
+            case .info:
+                TechnologyInfoScreen(appState: appState)
             case .onboarding:
                 OnboardingScreen(appState: appState)
             case .login:
@@ -1080,68 +1233,399 @@ struct ContentView: View {
             }
         }
         .animation(.easeInOut(duration: 0.5), value: appState.currentScreen)
+        .onChange(of: scenePhase) { phase in
+            if phase == .active && appState.currentScreen != .splash {
+                // Show splash screen every time app becomes active
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    appState.showSplashScreen()
+                }
+            } else if phase == .active {
+                // Refresh stats when app becomes active
+                appState.dataManager.updateUserStats()
+            }
+        }
     }
 }
 
 // MARK: - Splash Screen
 struct SplashScreen: View {
     @ObservedObject var appState: AppState
-    @State private var animateIcon = false
-    @State private var showText = false
+    @State private var showAiLogo = false
+    @State private var aiLogoScale: CGFloat = 0.5
+    @State private var aiLogoRotation: Double = -10
+    @State private var showGraceLogo = false
+    @State private var graceLogoOpacity: Double = 0
+    @State private var showTagline = false
+    @State private var showProgress = false
     
     var body: some View {
         ZStack {
-            Color.black
+            // Match homescreen background with animated highlight
+            ZStack {
+                // Base homescreen gradient
+                LinearGradient(
+                    gradient: Gradient(colors: [
+                        Color(red: 0.05, green: 0.05, blue: 0.1),
+                        Color(red: 0.1, green: 0.05, blue: 0.15),
+                        Color(red: 0.05, green: 0.05, blue: 0.1)
+                    ]),
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+                
+                // Sharp animated highlight overlay
+                LinearGradient(
+                    gradient: Gradient(colors: [
+                        Color.clear,
+                        Color.purple.opacity(0.15),
+                        Color.blue.opacity(0.15),
+                        Color.clear
+                    ]),
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+                .opacity(showAiLogo ? 1.0 : 0.3)
+                .animation(.easeInOut(duration: 2).repeatForever(autoreverses: true), value: showAiLogo)
+            }
                 .ignoresSafeArea()
             
-            VStack(spacing: 30) {
+            VStack(spacing: 0) {
                 Spacer()
                 
+                // Phase 1: Ai Logo Animation
+                if showAiLogo && !showGraceLogo {
                 VStack(spacing: 20) {
-                    Image(systemName: "music.note.list")
+                        Image("app-transicon") // Ai logo
                         .resizable()
                         .scaledToFit()
-                        .frame(width: 100, height: 100)
-                        .foregroundColor(.purple)
-                        .shadow(color: Color.purple.opacity(0.5), radius: 15, x: 0, y: 8)
-                        .scaleEffect(animateIcon ? 1.2 : 0.8)
-                        .animation(.easeInOut(duration: 1.5).repeatForever(autoreverses: true), value: animateIcon)
-                    
-                    if showText {
-                        VStack(spacing: 8) {
-                            Text("GraceAI")
-                                .font(.system(size: 42, weight: .bold, design: .rounded))
-                                .foregroundColor(.white)
-                            
+                            .frame(width: 200, height: 200)
+                            .scaleEffect(aiLogoScale)
+                            .rotationEffect(.degrees(aiLogoRotation))
+                            .shadow(color: Color.purple.opacity(0.6), radius: 20, x: 0, y: 10)
+                            .animation(.spring(response: 1.2, dampingFraction: 0.6), value: aiLogoScale)
+                            .animation(.easeInOut(duration: 0.8), value: aiLogoRotation)
+                    }
+                }
+                
+                // Phase 2: Grace Logo Transition
+                if showGraceLogo {
+                    VStack(spacing: 20) {
+                        Image("fulllogo") // Full GRACE logo
+                            .resizable()
+                            .scaledToFit()
+                            .frame(height: 120)
+                            .opacity(graceLogoOpacity)
+                            .shadow(color: Color.blue.opacity(0.6), radius: 15, x: 0, y: 8)
+                            .animation(.easeInOut(duration: 1.0), value: graceLogoOpacity)
+                        
+                        if showTagline {
                             Text("Your AI Music Learning Companion")
                                 .font(.title3)
-                                .foregroundColor(.white.opacity(0.7))
+                                .fontWeight(.medium)
+                                .foregroundColor(.white.opacity(0.8))
+                                .opacity(graceLogoOpacity)
+                                .animation(.easeInOut(duration: 0.8).delay(0.3), value: showTagline)
                         }
-                        .transition(.opacity.combined(with: .scale))
                     }
                 }
                 
                 Spacer()
                 
+                // Progress indicator
+                if showProgress {
                 ProgressView()
                     .progressViewStyle(CircularProgressViewStyle(tint: .purple))
                     .scaleEffect(1.2)
+                        .opacity(0.7)
+                        .animation(.easeInOut(duration: 0.5), value: showProgress)
+                }
             }
         }
         .onAppear {
-            animateIcon = true
-            
-            withAnimation(.easeInOut(duration: 0.8).delay(0.5)) {
-                showText = true
+            startAnimationSequence()
+        }
+    }
+    
+    private func startAnimationSequence() {
+        // Reset all animation states
+        showAiLogo = false
+        aiLogoScale = 0.5
+        aiLogoRotation = -10
+        showGraceLogo = false
+        graceLogoOpacity = 0
+        showTagline = false
+        showProgress = false
+        
+        // Phase 1: Ai Logo appears with bounce
+        withAnimation(.easeInOut(duration: 0.3)) {
+            showAiLogo = true
+        }
+        
+        withAnimation(.spring(response: 1.2, dampingFraction: 0.6).delay(0.2)) {
+            aiLogoScale = 1.0
+            aiLogoRotation = 0
+        }
+        
+        // Phase 2: Transition to Grace Logo
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            withAnimation(.easeInOut(duration: 0.8)) {
+                showGraceLogo = true
             }
             
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
-                withAnimation {
-                    appState.currentScreen = .onboarding
+            withAnimation(.easeInOut(duration: 1.0).delay(0.2)) {
+                graceLogoOpacity = 1.0
+            }
+            
+            withAnimation(.easeInOut(duration: 0.5).delay(0.8)) {
+                showTagline = true
+            }
+        }
+        
+        // Show progress indicator
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+            withAnimation(.easeInOut(duration: 0.5)) {
+                showProgress = true
+            }
+        }
+        
+        // Navigate to appropriate screen based on login state
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
+            withAnimation {
+                if appState.isLoggedIn {
+                    appState.currentScreen = .main
+                } else {
+                    // Check if user has seen the info screen before
+                    let hasSeenInfoScreen = UserDefaults.standard.bool(forKey: "hasSeenInfoScreen")
+                    appState.currentScreen = hasSeenInfoScreen ? .login : .info
                 }
             }
         }
     }
+}
+
+// MARK: - Technology Info Screen
+struct TechnologyInfoScreen: View {
+    @ObservedObject var appState: AppState
+    @State private var currentPage = 0
+    @State private var animateContent = false
+    
+    let infoPages = [
+        InfoPage(
+            icon: "eye.circle.fill",
+            title: "Optical Music Recognition",
+            description: "Our advanced AI uses OMR technology to analyze your sheet music and understand every note, rhythm, and musical element."
+        ),
+        InfoPage(
+            icon: "waveform",
+            title: "Audio Analysis",
+            description: "Record your performance and our AI compares it against the sheet music to provide detailed feedback on accuracy and timing."
+        ),
+        InfoPage(
+            icon: "brain.head.profile",
+            title: "AI-Powered Feedback",
+            description: "Get personalized insights, practice tips, and progress tracking to help you improve your musical skills faster."
+        ),
+        InfoPage(
+            icon: "chart.line.uptrend.xyaxis",
+            title: "Track Your Progress",
+            description: "Monitor your improvement over time with detailed analytics and see how your musical abilities evolve."
+        )
+    ]
+    
+    var body: some View {
+        ZStack {
+            backgroundGradient
+            
+            VStack(spacing: 0) {
+                // Header
+                VStack(spacing: 16) {
+                    Image("fulllogo")
+                        .resizable()
+                        .scaledToFit()
+                        .frame(height: 40)
+                        .brightness(0.2)
+                        .saturation(1.2)
+                        .shadow(color: Color.purple.opacity(0.3), radius: 5, x: 0, y: 2)
+                        .opacity(animateContent ? 1 : 0)
+                        .animation(.easeInOut(duration: 0.8).delay(0.2), value: animateContent)
+                    
+                    Text("How GraceAI Works")
+                        .font(.title)
+                        .fontWeight(.bold)
+                        .foregroundColor(.white)
+                        .opacity(animateContent ? 1 : 0)
+                        .animation(.easeInOut(duration: 0.8).delay(0.4), value: animateContent)
+                    
+                    Text("Advanced AI technology meets music education")
+                        .font(.subheadline)
+                        .foregroundColor(.white.opacity(0.7))
+                        .opacity(animateContent ? 1 : 0)
+                        .animation(.easeInOut(duration: 0.8).delay(0.6), value: animateContent)
+                }
+                .padding(.top, 60)
+                .padding(.horizontal, 20)
+                
+                // Content
+                TabView(selection: $currentPage) {
+                    ForEach(0..<infoPages.count, id: \.self) { index in
+                        InfoPageView(page: infoPages[index])
+                            .tag(index)
+                    }
+                }
+                .tabViewStyle(PageTabViewStyle(indexDisplayMode: .never))
+                .frame(height: 400)
+                
+                // Page Indicators
+                HStack(spacing: 8) {
+                    ForEach(0..<infoPages.count, id: \.self) { index in
+                        Circle()
+                            .fill(index == currentPage ? Color.purple : Color.white.opacity(0.3))
+                            .frame(width: 8, height: 8)
+                            .scaleEffect(index == currentPage ? 1.2 : 1.0)
+                            .animation(.spring(response: 0.3, dampingFraction: 0.7), value: currentPage)
+                    }
+                }
+                .padding(.top, 20)
+                
+                Spacer()
+                
+                // Navigation Buttons
+                HStack(spacing: 16) {
+                    Button(action: {
+                        // Mark that user has seen the info screen
+                        UserDefaults.standard.set(true, forKey: "hasSeenInfoScreen")
+                withAnimation {
+                    appState.currentScreen = .onboarding
+                }
+                    }) {
+                        Text("Skip")
+                            .font(.headline)
+                            .foregroundColor(.white.opacity(0.7))
+                            .padding(.horizontal, 24)
+                            .padding(.vertical, 12)
+                    }
+                    
+                    Spacer()
+                    
+                    Button(action: {
+                        if currentPage < infoPages.count - 1 {
+                            withAnimation(.spring(response: 0.5, dampingFraction: 0.8)) {
+                                currentPage += 1
+                            }
+                        } else {
+                            // Mark that user has seen the info screen
+                            UserDefaults.standard.set(true, forKey: "hasSeenInfoScreen")
+                            withAnimation {
+                                appState.currentScreen = .onboarding
+                            }
+                        }
+                    }) {
+                        HStack(spacing: 8) {
+                            Text(currentPage < infoPages.count - 1 ? "Next" : "Get Started")
+                                .font(.headline)
+                                .fontWeight(.semibold)
+                            Image(systemName: "arrow.right")
+                                .font(.headline)
+                        }
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 24)
+                        .padding(.vertical, 12)
+                        .background(
+                            LinearGradient(
+                                gradient: Gradient(colors: [Color.purple, Color.blue]),
+                                startPoint: .leading,
+                                endPoint: .trailing
+                            )
+                        )
+                        .cornerRadius(25)
+                        .shadow(color: Color.purple.opacity(0.5), radius: 10, x: 0, y: 5)
+                    }
+                    .buttonStyle(PressableButtonStyle())
+                }
+                .padding(.horizontal, 20)
+                .padding(.bottom, 40)
+            }
+        }
+        .onAppear {
+            withAnimation(.easeInOut(duration: 0.8)) {
+                animateContent = true
+            }
+        }
+    }
+    
+    private var backgroundGradient: some View {
+        LinearGradient(
+            gradient: Gradient(colors: [
+                Color(red: 0.05, green: 0.05, blue: 0.1),
+                Color(red: 0.1, green: 0.05, blue: 0.15),
+                Color(red: 0.05, green: 0.05, blue: 0.1)
+            ]),
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+        )
+        .ignoresSafeArea()
+    }
+}
+
+// MARK: - Info Page View
+struct InfoPageView: View {
+    let page: InfoPage
+    @State private var animateIcon = false
+    @State private var animateText = false
+    
+    var body: some View {
+        VStack(spacing: 30) {
+            Spacer()
+            
+            // Icon
+            Image(systemName: page.icon)
+                .font(.system(size: 80))
+                .foregroundStyle(
+                    LinearGradient(
+                        colors: [.purple, .blue],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .scaleEffect(animateIcon ? 1.0 : 0.5)
+                .animation(.spring(response: 0.8, dampingFraction: 0.6), value: animateIcon)
+            
+            // Content
+            VStack(spacing: 16) {
+                Text(page.title)
+                    .font(.title2)
+                    .fontWeight(.bold)
+                    .foregroundColor(.white)
+                    .multilineTextAlignment(.center)
+                    .opacity(animateText ? 1 : 0)
+                    .animation(.easeInOut(duration: 0.8).delay(0.2), value: animateText)
+                
+                Text(page.description)
+                    .font(.body)
+                    .foregroundColor(.white.opacity(0.8))
+                    .multilineTextAlignment(.center)
+                    .lineSpacing(4)
+                    .padding(.horizontal, 20)
+                    .opacity(animateText ? 1 : 0)
+                    .animation(.easeInOut(duration: 0.8).delay(0.4), value: animateText)
+            }
+            
+            Spacer()
+        }
+        .onAppear {
+            withAnimation {
+                animateIcon = true
+                animateText = true
+            }
+        }
+    }
+}
+
+// MARK: - Info Page Model
+struct InfoPage {
+    let icon: String
+    let title: String
+    let description: String
 }
 
 // MARK: - Onboarding Screen
@@ -1285,19 +1769,20 @@ struct LoginScreen: View {
             
             ScrollView {
                 VStack(spacing: 30) {
-                    VStack(spacing: 16) {
-                        Image(systemName: "music.note.list")
-                            .font(.system(size: 60))
-                            .foregroundColor(.purple)
-                        
-                        Text("Welcome to GraceAI")
-                            .font(.title)
-                            .fontWeight(.bold)
-                            .foregroundColor(.white)
+                    VStack(spacing: 20) {
+                        // GRACE Logo
+                        Image("fulllogo")
+                            .resizable()
+                            .scaledToFit()
+                            .frame(height: 60)
+                            .brightness(0.2)
+                            .saturation(1.2)
+                            .shadow(color: Color.purple.opacity(0.3), radius: 5, x: 0, y: 2)
                         
                         Text(isSignUp ? "Create your account" : "Sign in to continue")
-                            .font(.subheadline)
-                            .foregroundColor(.white.opacity(0.7))
+                            .font(.title2)
+                            .fontWeight(.medium)
+                            .foregroundColor(.white)
                             .animation(.easeInOut(duration: 0.3), value: isSignUp)
                     }
                     .padding(.top, 60)
@@ -1532,10 +2017,12 @@ struct LoginScreen: View {
         Task {
             do {
                 let profile: UserProfile
+                let accessToken: String
                 
                 if isSignUp {
-                    let (userProfile, accessToken) = try await appState.supabaseService.signUp(email: email, password: password, name: name)
+                    let (userProfile, token) = try await appState.supabaseService.signUp(email: email, password: password, name: name)
                     profile = userProfile
+                    accessToken = token
                     
                     // Note: Profile creation is handled by Supabase trigger automatically
                     // No need to manually create profile - this was causing the database error
@@ -1545,8 +2032,9 @@ struct LoginScreen: View {
                         UserDefaults.standard.set(accessToken, forKey: "supabaseAccessToken")
                     }
                 } else {
-                    let (userProfile, accessToken) = try await appState.supabaseService.signIn(email: email, password: password)
+                    let (userProfile, token) = try await appState.supabaseService.signIn(email: email, password: password)
                     profile = userProfile
+                    accessToken = token
                     
                     await MainActor.run {
                         self.appState.supabaseAccessToken = accessToken
@@ -1558,8 +2046,7 @@ struct LoginScreen: View {
                     self.isLoading = false
                     
                     // Save profile and login immediately for faster experience
-                        self.appState.saveUserProfile(profile)
-                        self.appState.isLoggedIn = true
+                    self.appState.saveUserSession(profile: profile, accessToken: accessToken)
         
                     // Show success message and navigate
                     self.alertMessage = isSignUp ? "🎉 Account created successfully! Welcome to GraceAI!" : "✅ Welcome back, \(profile.name)!"
@@ -1663,9 +2150,7 @@ struct LoginScreen: View {
                     
                     await MainActor.run {
                         self.isLoading = false
-                        self.appState.saveUserProfile(profile)
-                        self.appState.supabaseAccessToken = accessToken
-                        self.appState.isLoggedIn = true
+                        self.appState.saveUserSession(profile: profile, accessToken: accessToken)
                         
                         withAnimation {
                             self.appState.currentScreen = .main
@@ -1833,7 +2318,7 @@ struct HomeScreen: View {
                 Path { path in
                     let width = geometry.size.width
                     let height = geometry.size.height
-                    let gridSize: CGFloat = 40
+                    let gridSize: CGFloat = 60
                     
                     for x in stride(from: 0, through: width, by: gridSize) {
                         path.move(to: CGPoint(x: x, y: 0))
@@ -1845,7 +2330,7 @@ struct HomeScreen: View {
                         path.addLine(to: CGPoint(x: width, y: y))
                     }
                 }
-                .stroke(Color.white.opacity(0.03), lineWidth: 0.5)
+                .stroke(Color.white.opacity(0.01), lineWidth: 0.3)
             }
         }
         .ignoresSafeArea()
@@ -1854,7 +2339,6 @@ struct HomeScreen: View {
     private var appHeader: some View {
         VStack(spacing: 12) {
             HStack(spacing: 12) {
-                appIcon
                 appTitle
                 Spacer()
             }
@@ -1866,36 +2350,16 @@ struct HomeScreen: View {
         .padding(.top)
     }
     
-    private var appIcon: some View {
-        ZStack {
-            Circle()
-                .fill(
-                    LinearGradient(
-                        gradient: Gradient(colors: [Color.purple, Color.blue]),
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                )
-                .frame(width: 60, height: 60)
-                .shadow(color: Color.purple.opacity(0.5), radius: 10, x: 0, y: 5)
-            
-            Image(systemName: "brain.head.profile")
-                .font(.title)
-                .foregroundColor(.white)
-        }
-    }
     
     private var appTitle: some View {
         VStack(alignment: .leading, spacing: 4) {
-                            Text("GraceAI")
-                .font(.system(size: 28, weight: .bold, design: .rounded))
-                                .foregroundStyle(
-                                    LinearGradient(
-                                        gradient: Gradient(colors: [Color.purple, Color.blue]),
-                                        startPoint: .leading,
-                                        endPoint: .trailing
-                                    )
-                                )
+            Image("fulllogo")
+                .resizable()
+                .scaledToFit()
+                .frame(height: 48)
+                .brightness(0.2)
+                .saturation(1.2)
+                .shadow(color: Color.purple.opacity(0.3), radius: 5, x: 0, y: 2)
                             
             Text("AI Music Learning Companion")
                 .font(.caption)
@@ -2077,6 +2541,10 @@ struct ModernStatsCards: View {
         .background(Color.white.opacity(0.05))
         .cornerRadius(16)
         .padding(.horizontal)
+        .onAppear {
+            // Refresh stats when the cards appear
+            appState.dataManager.updateUserStats()
+        }
     }
 }
 
@@ -2373,7 +2841,7 @@ struct PracticeScreen: View {
                         Path { path in
                             let width = geometry.size.width
                             let height = geometry.size.height
-                            let gridSize: CGFloat = 40
+                            let gridSize: CGFloat = 60
                             
                             for x in stride(from: 0, through: width, by: gridSize) {
                                 path.move(to: CGPoint(x: x, y: 0))
@@ -2385,7 +2853,7 @@ struct PracticeScreen: View {
                                 path.addLine(to: CGPoint(x: width, y: y))
                             }
                         }
-                        .stroke(Color.white.opacity(0.03), lineWidth: 0.5)
+                        .stroke(Color.white.opacity(0.01), lineWidth: 0.3)
                     }
                 }
                     .ignoresSafeArea()
@@ -3678,7 +4146,7 @@ struct HistoryScreen: View {
                 Path { path in
                     let width = geometry.size.width
                     let height = geometry.size.height
-                    let gridSize: CGFloat = 40
+                    let gridSize: CGFloat = 60
                     
                     for x in stride(from: 0, through: width, by: gridSize) {
                         path.move(to: CGPoint(x: x, y: 0))
@@ -3690,7 +4158,7 @@ struct HistoryScreen: View {
                         path.addLine(to: CGPoint(x: width, y: y))
                     }
                 }
-                .stroke(Color.white.opacity(0.03), lineWidth: 0.5)
+                .stroke(Color.white.opacity(0.01), lineWidth: 0.3)
             }
         }
         .ignoresSafeArea()
@@ -4353,7 +4821,6 @@ struct ModernSessionRow: View {
 struct ProfileScreen: View {
     @ObservedObject var appState: AppState
     @State private var showingLogoutAlert = false
-    @State private var showingResetAlert = false
     
     var body: some View {
         NavigationView {
@@ -4367,10 +4834,7 @@ struct ProfileScreen: View {
                         ProfileStats(appState: appState)
                         SettingsSection()
                         
-                        VStack(spacing: 12) {
                             LogoutButton(showingLogoutAlert: $showingLogoutAlert, appState: appState)
-                            ResetButton(showingResetAlert: $showingResetAlert, appState: appState)
-                        }
                     }
                     .padding(.horizontal, 20)
                 }
@@ -4385,14 +4849,6 @@ struct ProfileScreen: View {
             }
         } message: {
             Text("Are you sure you want to logout?")
-        }
-        .alert("Reset App", isPresented: $showingResetAlert) {
-            Button("Cancel", role: .cancel) { }
-            Button("Reset", role: .destructive) {
-                appState.resetToSplash()
-            }
-        } message: {
-            Text("This will reset the app to the splash screen. Are you sure?")
         }
     }
 }
@@ -4440,7 +4896,16 @@ struct ProfileStats: View {
         ], spacing: 16) {
             ProfileStatCard(title: "Sessions", value: "\(appState.userProfile?.totalSessions ?? 0)", icon: "music.note")
             ProfileStatCard(title: "Accuracy", value: "\(Int(appState.userProfile?.averageAccuracy ?? 0))%", icon: "target")
-            ProfileStatCard(title: "Streak", value: "\(appState.userProfile?.currentStreak ?? 0) days", icon: "flame")
+            ProfileStatCard(
+                title: "Streak", 
+                value: "\(appState.userProfile?.currentStreak ?? 0) days", 
+                icon: (appState.userProfile?.currentStreak ?? 0) > 0 ? "flame.fill" : "flame",
+                isActive: (appState.userProfile?.currentStreak ?? 0) > 0
+            )
+        }
+        .onAppear {
+            // Refresh stats when profile tab is viewed
+            appState.dataManager.updateUserStats()
         }
     }
 }
@@ -4449,13 +4914,21 @@ struct ProfileStatCard: View {
     let title: String
     let value: String
     let icon: String
+    let isActive: Bool
+    
+    init(title: String, value: String, icon: String, isActive: Bool = false) {
+        self.title = title
+        self.value = value
+        self.icon = icon
+        self.isActive = isActive
+    }
     
     var body: some View {
         VStack(spacing: 8) {
             Image(systemName: icon)
                 .font(.title3)
-                .foregroundColor(.purple)
-                .shadow(color: .purple.opacity(0.3), radius: 5, x: 0, y: 2)
+                .foregroundColor(isActive ? .orange : .purple)
+                .shadow(color: (isActive ? Color.orange : Color.purple).opacity(0.3), radius: 5, x: 0, y: 2)
             
             Text(value)
                 .font(.title3)
@@ -4468,13 +4941,27 @@ struct ProfileStatCard: View {
         }
         .frame(maxWidth: .infinity)
         .padding()
-        .background(Color.gray.opacity(0.2))
-        .cornerRadius(12)
-        .shadow(color: .purple.opacity(0.2), radius: 8, x: 0, y: 4)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color.gray.opacity(0.2))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12)
+                        .stroke(isActive ? Color.orange.opacity(0.5) : Color.clear, lineWidth: 1)
+                )
+        )
+        .shadow(
+            color: isActive ? Color.orange.opacity(0.3) : Color.purple.opacity(0.2), 
+            radius: isActive ? 12 : 8, 
+            x: 0, 
+            y: 4
+        )
     }
 }
 
 struct SettingsSection: View {
+    @State private var showingFAQ = false
+    @State private var showingContactForm = false
+    
     var body: some View {
         VStack(spacing: 16) {
             HStack {
@@ -4486,13 +4973,21 @@ struct SettingsSection: View {
             
             VStack(spacing: 0) {
                 SettingsRow(icon: "bell", title: "Notifications", subtitle: "Practice reminders")
-                SettingsRow(icon: "gear", title: "Preferences", subtitle: "App settings")
-                SettingsRow(icon: "questionmark.circle", title: "Help", subtitle: "Support & FAQ")
-                SettingsRow(icon: "info.circle", title: "About", subtitle: "App version 1.0.0")
+                SettingsRowWithAction(
+                    icon: "questionmark.circle", 
+                    title: "Help", 
+                    subtitle: "Support & FAQ"
+                ) {
+                    showingContactForm = true
+                }
+                SettingsRow(icon: "info.circle", title: "About", subtitle: "GraceAI eos1.1")
             }
             .background(Color.gray.opacity(0.2))
             .cornerRadius(16)
             .shadow(color: .purple.opacity(0.2), radius: 10, x: 0, y: 5)
+        }
+        .sheet(isPresented: $showingContactForm) {
+            ContactSupportView()
         }
     }
 }
@@ -4526,6 +5021,233 @@ struct SettingsRow: View {
         }
         .padding()
         .background(Color.gray.opacity(0.2))
+    }
+}
+
+struct SettingsRowWithAction: View {
+    let icon: String
+    let title: String
+    let subtitle: String
+    let action: () -> Void
+    
+    var body: some View {
+        Button(action: action) {
+            HStack {
+                Image(systemName: icon)
+                    .foregroundColor(.purple)
+                    .frame(width: 20)
+                
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.subheadline)
+                        .fontWeight(.medium)
+                        .foregroundColor(.white)
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundColor(.white.opacity(0.7))
+                }
+                
+                Spacer()
+                
+                Image(systemName: "chevron.right")
+                    .foregroundColor(.white.opacity(0.7))
+                    .font(.caption)
+            }
+            .padding()
+            .background(Color.gray.opacity(0.2))
+        }
+        .buttonStyle(PlainButtonStyle())
+    }
+}
+
+struct ContactSupportView: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = ""
+    @State private var email = ""
+    @State private var message = ""
+    @State private var isSubmitting = false
+    @State private var showingAlert = false
+    @State private var alertMessage = ""
+    @State private var showingFullFAQ = false
+    
+    var body: some View {
+        NavigationView {
+            ZStack {
+                LinearGradient(
+                    gradient: Gradient(colors: [
+                        Color(red: 0.05, green: 0.05, blue: 0.1),
+                        Color(red: 0.1, green: 0.05, blue: 0.15),
+                        Color(red: 0.05, green: 0.05, blue: 0.1)
+                    ]),
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+                .ignoresSafeArea()
+                
+                ScrollView {
+                    VStack(spacing: 24) {
+                        VStack(spacing: 16) {
+                            Image(systemName: "envelope.circle.fill")
+                                .font(.system(size: 60))
+                                .foregroundColor(.purple)
+                            
+                            Text("Contact Support")
+                                .font(.title2)
+                                .fontWeight(.bold)
+                                .foregroundColor(.white)
+                            
+                            Text("We're here to help! Send us your feedback or questions.")
+                                .font(.subheadline)
+                                .foregroundColor(.white.opacity(0.7))
+                                .multilineTextAlignment(.center)
+                        }
+                        
+                        VStack(spacing: 16) {
+                            CustomTextField(
+                                text: $name,
+                                placeholder: "Your Name",
+                                icon: "person.fill"
+                            )
+                            
+                            CustomTextField(
+                                text: $email,
+                                placeholder: "Your Email",
+                                icon: "envelope.fill"
+                            )
+                            
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Message")
+                                    .font(.subheadline)
+                                    .fontWeight(.medium)
+                                    .foregroundColor(.white)
+                                
+                                TextEditor(text: $message)
+                                    .frame(minHeight: 120)
+                                    .padding(12)
+                                    .background(Color.gray.opacity(0.2))
+                                    .cornerRadius(12)
+                                    .foregroundColor(.white)
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 12)
+                                            .stroke(Color.purple.opacity(0.3), lineWidth: 1)
+                                    )
+                            }
+                        }
+                        
+                        Button(action: submitFeedback) {
+                            HStack {
+                                if isSubmitting {
+                                    ProgressView()
+                                        .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                                        .scaleEffect(0.8)
+                                } else {
+                                    Image(systemName: "paperplane.fill")
+                                }
+                                Text(isSubmitting ? "Sending..." : "Send Message")
+                                    .fontWeight(.semibold)
+                            }
+                            .foregroundColor(.white)
+                            .frame(maxWidth: .infinity)
+                            .padding()
+                            .background(
+                                LinearGradient(
+                                    gradient: Gradient(colors: [.purple, .blue]),
+                                    startPoint: .leading,
+                                    endPoint: .trailing
+                                )
+                            )
+                            .cornerRadius(12)
+                            .shadow(color: Color.purple.opacity(0.5), radius: 10, x: 0, y: 5)
+                        }
+                        .disabled(isSubmitting || name.isEmpty || email.isEmpty || message.isEmpty)
+                        
+                        // FAQ Section
+                        VStack(spacing: 12) {
+                            Text("Frequently Asked Questions")
+                                .font(.headline)
+                                .foregroundColor(.white)
+                            
+                            VStack(spacing: 8) {
+                                FAQQuickItem(question: "What do I do if I get errors?", answer: "Try uploading a clearer picture of the sheet music. Make sure the image is well-lit, in focus, and shows the complete piece.")
+                                FAQQuickItem(question: "How do I record my piano performance?", answer: "Use the Voice Memos app on your iPhone to record your playing. Then tap the 3 dots (⋯) next to your recording and select 'Save to Files'.")
+                                FAQQuickItem(question: "What file formats are supported?", answer: "For audio: M4A files from Voice Memos. For sheet music: PDF format works best.")
+                                FAQQuickItem(question: "How accurate is the AI analysis?", answer: "The AI provides detailed feedback on note accuracy, timing, and tempo. For best results, record in a quiet environment.")
+                                FAQQuickItem(question: "How long does analysis take?", answer: "Analysis typically takes 30-60 seconds depending on the length of your recording and complexity of the piece.")
+                            }
+                            
+                            Button(action: { showingFullFAQ = true }) {
+                                Text("View Full FAQ")
+                                    .font(.subheadline)
+                                    .fontWeight(.medium)
+                                    .foregroundColor(.purple)
+                                    .padding(.top, 8)
+                            }
+                        }
+                        .padding()
+                        .background(Color.white.opacity(0.05))
+                        .cornerRadius(16)
+                    }
+                    .padding(.horizontal, 20)
+                }
+            }
+            .navigationTitle("Support")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") {
+                        dismiss()
+                    }
+                    .foregroundColor(.white)
+                }
+            }
+        }
+        .alert("Message Sent", isPresented: $showingAlert) {
+            Button("OK") {
+                dismiss()
+            }
+        } message: {
+            Text(alertMessage)
+        }
+        .sheet(isPresented: $showingFullFAQ) {
+            FAQView()
+        }
+    }
+    
+    private func submitFeedback() {
+        guard !name.isEmpty, !email.isEmpty, !message.isEmpty else { return }
+        
+        isSubmitting = true
+        
+        // Simulate sending feedback (in a real app, you'd send this to your backend)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            isSubmitting = false
+            alertMessage = "Thank you for your feedback! We'll get back to you soon at \(email)."
+            showingAlert = true
+            
+            // Reset form
+            name = ""
+            email = ""
+            message = ""
+        }
+    }
+}
+
+struct FAQQuickItem: View {
+    let question: String
+    let answer: String
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(question)
+                .font(.subheadline)
+                .fontWeight(.medium)
+                .foregroundColor(.white)
+            Text(answer)
+                .font(.caption)
+                .foregroundColor(.white.opacity(0.7))
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 4)
     }
 }
 
@@ -4867,9 +5589,9 @@ struct QuickPracticeScreen: View {
                 try FileManager.default.removeItem(at: tempURL)
             }
             try FileManager.default.copyItem(at: audioURL, to: tempURL)
-            
-            // Set the filename for display
-            savedFilename = filename
+        
+        // Set the filename for display
+        savedFilename = filename
             shareURL = tempURL
             
             // Trigger the share sheet
@@ -4985,7 +5707,7 @@ struct ResultsView: View {
             Path { path in
                 let width = geometry.size.width
                 let height = geometry.size.height
-                let gridSize: CGFloat = 40
+                let gridSize: CGFloat = 60
                 
                 for x in stride(from: 0, through: width, by: gridSize) {
                     path.move(to: CGPoint(x: x, y: 0))
