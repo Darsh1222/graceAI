@@ -19,24 +19,9 @@
 			</array>
 		</dict>
 	</array>
-	<key>NSAppTransportSecurity</key>
-	<dict>
-		<key>NSAllowsArbitraryLoads</key>
-		<true/>
-		<key>NSExceptionDomains</key>
-		<dict>
-			<key>tunein-backend-alb-1055077303.us-east-1.elb.amazonaws.com</key>
-			<dict>
-				<key>NSExceptionAllowsInsecureHTTPLoads</key>
-				<true/>
-				<key>NSExceptionMinimumTLSVersion</key>
-				<string>TLSv1.0</string>
-				<key>NSIncludesSubdomains</key>
-				<true/>
-			</dict>
-		</dict>
-	</dict>
-	<key>NSMicrophoneUsageDescription</key>
-	<string>This app needs access to your microphone to record your musical performance for analysis.</string>
+	<key>NSDocumentPickerUsageDescription</key>
+	<string>This app needs access to your documents to save and share your practice recordings.</string>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 </dict>
 </plist>

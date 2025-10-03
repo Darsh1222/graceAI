@@ -10,6 +10,7 @@ import SwiftUI
 import AVFoundation
 import UniformTypeIdentifiers
 import Supabase
+import Network
 
 // MARK: - Notification Names
 extension Notification.Name {
@@ -25,7 +26,7 @@ struct BackendConfig {
         if useLocalBackend {
             return "http://localhost:8000"
         } else {
-            return "http://tunein-backend-alb-1055077303.us-east-1.elb.amazonaws.com"
+            return "https://api.graceai.music"
         }
     }
 }
@@ -45,9 +46,21 @@ class SupabaseService: ObservableObject {
     @Published var isAuthenticated = false
     
     private init() {
+        // Configure URLSession with longer timeouts for cellular and slow networks
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = 240.0 // 4 minutes
+        configuration.timeoutIntervalForResource = 240.0 // 4 minutes
+        configuration.waitsForConnectivity = true // Wait for connection if temporarily lost
+        let session = URLSession(configuration: configuration)
+        
         self.client = SupabaseClient(
             supabaseURL: URL(string: SupabaseConfig.url)!,
-            supabaseKey: SupabaseConfig.anonKey
+            supabaseKey: SupabaseConfig.anonKey,
+            options: SupabaseClientOptions(
+                global: SupabaseClientOptions.GlobalOptions(
+                    session: session
+                )
+            )
         )
         checkAuthStatus()
     }
@@ -203,9 +216,99 @@ class SupabaseService: ObservableObject {
     
     // MARK: - File Storage
     func uploadFile(_ data: Data, fileName: String, bucket: String = "user-audio") async throws -> String {
-        let filePath = "\(currentUser?.id.uuidString ?? "anonymous")/\(fileName)"
-        try await client.storage.from(bucket).upload(path: filePath, file: data)
-        return filePath
+        print("🔍 Starting file upload process...")
+        print("📦 Bucket: \(bucket)")
+        print("📁 File: \(fileName)")
+        print("📏 Data size: \(data.count) bytes")
+        
+        // Ensure user is authenticated before uploading
+        guard let user = currentUser else {
+            print("❌ Upload failed: User not authenticated")
+            print("🔍 Current user: \(String(describing: currentUser))")
+            print("🔍 Is authenticated: \(isAuthenticated)")
+            throw SupabaseError.notAuthenticated
+        }
+        
+        print("✅ User authenticated: \(user.id.uuidString)")
+        
+        // Verify authentication session is still valid
+        do {
+            let session = try await client.auth.session
+            print("✅ Session valid for user: \(session.user.id.uuidString)")
+            if session.user.id != user.id {
+                print("❌ Upload failed: Session user mismatch")
+                print("🔍 Expected: \(user.id.uuidString)")
+                print("🔍 Actual: \(session.user.id.uuidString)")
+                throw SupabaseError.sessionExpired
+            }
+        } catch {
+            print("❌ Upload failed: Session validation failed - \(error)")
+            print("🔍 Session error details: \(error.localizedDescription)")
+            throw SupabaseError.sessionExpired
+        }
+        
+        let filePath = "\(user.id.uuidString)/\(fileName)"
+        print("📤 Uploading file to path: \(filePath)")
+        
+        // Retry upload up to 3 times with exponential backoff
+        var lastError: Error?
+        for attempt in 1...3 {
+            do {
+                print("🔄 Upload attempt \(attempt)/3")
+                try await client.storage.from(bucket).upload(path: filePath, file: data)
+                print("✅ File uploaded successfully: \(fileName)")
+                return filePath
+            } catch let error as URLError {
+                lastError = error
+                print("❌ Upload attempt \(attempt) failed with URL error: \(error.code.rawValue)")
+                print("🔍 Error description: \(error.localizedDescription)")
+                
+                // Check if it's a network-related error
+                if error.code == .notConnectedToInternet || 
+                   error.code == .networkConnectionLost ||
+                   error.code == .timedOut ||
+                   error.code == .cannotConnectToHost {
+                    print("🔍 This is a network connectivity issue")
+                    
+                    // Wait before retrying (exponential backoff)
+                    if attempt < 3 {
+                        let delay = Double(attempt) * 5.0 // 5s, 10s
+                        print("⏳ Waiting \(delay) seconds before retry...")
+                        try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                        continue
+                    }
+                }
+                
+                // If not a retryable error or last attempt, throw network error
+                throw SupabaseError.networkError
+            } catch {
+                lastError = error
+                print("❌ Upload attempt \(attempt) failed: \(error)")
+                print("🔍 Error details: \(error.localizedDescription)")
+                
+                // Provide more specific error information
+                if error.localizedDescription.contains("authenticate") ||
+                   error.localizedDescription.contains("401") {
+                    print("🔍 This appears to be an authentication issue")
+                    throw SupabaseError.authError(error.localizedDescription)
+                }
+                
+                // Wait before retrying
+                if attempt < 3 {
+                    let delay = Double(attempt) * 5.0 // 5s, 10s
+                    print("⏳ Waiting \(delay) seconds before retry...")
+                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    continue
+                }
+                
+                // Last attempt failed
+                throw SupabaseError.networkError
+            }
+        }
+        
+        // All attempts failed
+        print("❌ All upload attempts failed")
+        throw lastError ?? SupabaseError.networkError
     }
     
     func downloadFile(filePath: String, bucket: String = "user-audio") async throws -> Data {
@@ -214,6 +317,28 @@ class SupabaseService: ObservableObject {
     
     func getPublicURL(filePath: String, bucket: String = "user-audio") -> URL? {
         return try? client.storage.from(bucket).getPublicURL(path: filePath)
+    }
+    
+    // MARK: - Feedback System
+    func storeFeedback(_ feedback: FeedbackData) async throws {
+        try await client.database
+            .from("feedback")
+            .insert(feedback)
+            .execute()
+    }
+    
+    func sendFeedbackEmail(_ feedback: FeedbackData) async throws {
+        do {
+            let response = try await client.functions
+                .invoke("send-feedback-email", options: FunctionInvokeOptions(
+                    body: feedback
+                ))
+            
+            print("📧 Edge Function response: \(response)")
+        } catch {
+            print("❌ Edge Function error: \(error)")
+            throw error
+        }
     }
     
     // MARK: - Practice Sessions
@@ -399,6 +524,40 @@ class BackendService: ObservableObject {
         }
     }
     
+    private func ensureLocalFileAccess(from url: URL, type: String) async throws -> URL {
+        // If file is already in app's documents directory, use it directly
+        let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        if url.path.hasPrefix(documentsPath.path) {
+            print("✅ File already local: \(url.lastPathComponent)")
+            return url
+        }
+        
+        // File is not local (possibly in iCloud), copy it to local directory
+        print("📁 Copying \(type) file from iCloud to local directory...")
+        
+        let timestamp = Date().timeIntervalSince1970
+        let filename = "\(type)_\(Int(timestamp)).\(url.pathExtension)"
+        let localURL = documentsPath.appendingPathComponent(filename)
+        
+        // Start accessing the security-scoped resource if needed
+        let accessing = url.startAccessingSecurityScopedResource()
+        defer {
+            if accessing {
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
+        
+        // Copy the file to local directory
+        if FileManager.default.fileExists(atPath: localURL.path) {
+            try FileManager.default.removeItem(at: localURL)
+        }
+        
+        try FileManager.default.copyItem(at: url, to: localURL)
+        print("✅ File copied to local: \(localURL.lastPathComponent)")
+        
+        return localURL
+    }
+    
     func analyzePerformance(audioURL: URL, sheetMusicURL: URL, userId: String, appState: AppState) async throws -> (authResult: AnalysisResult, audioURL: String, sheetMusicURL: String) {
         print("🎵 BackendService: Starting analysis...")
         
@@ -409,19 +568,48 @@ class BackendService: ObservableObject {
         await updateProgress(step: 1)
         try await Task.sleep(nanoseconds: 500_000_000) // 0.5 second delay for better UX
         
-        let audioData = try Data(contentsOf: audioURL)
-        let sheetMusicData = try Data(contentsOf: sheetMusicURL)
+        // Ensure files are accessible by copying to local directory if needed
+        let localAudioURL = try await ensureLocalFileAccess(from: audioURL, type: "audio")
+        let localSheetMusicURL = try await ensureLocalFileAccess(from: sheetMusicURL, type: "sheet")
+        
+        let audioData = try Data(contentsOf: localAudioURL)
+        let sheetMusicData = try Data(contentsOf: localSheetMusicURL)
+        
+        // Log file sizes
+        let audioSizeMB = Double(audioData.count) / 1_048_576.0
+        let sheetSizeMB = Double(sheetMusicData.count) / 1_048_576.0
+        let totalSizeMB = audioSizeMB + sheetSizeMB
+        print("📊 Audio file size: \(String(format: "%.2f", audioSizeMB)) MB")
+        print("📊 Sheet music file size: \(String(format: "%.2f", sheetSizeMB)) MB")
+        print("📊 Total upload size: \(String(format: "%.2f", totalSizeMB)) MB")
+        
+        // Check network type and warn if on cellular with large files
+        let networkType = getNetworkType()
+        print("📶 Network type: \(networkType)")
+        
+        if networkType == "Cellular" && totalSizeMB > 5.0 {
+            print("⚠️ Warning: Uploading \(String(format: "%.2f", totalSizeMB)) MB on cellular - this may take a while or timeout")
+            print("💡 Tip: For best results with files over 5MB, use WiFi")
+        }
         
         let audioFileName = "audio_\(UUID().uuidString).m4a"
         let sheetMusicFileName = "sheet_\(UUID().uuidString).pdf"
         
         // Step 2: Upload audio
         await updateProgress(step: 2)
+        print("📤 Starting audio upload (\(String(format: "%.2f", audioSizeMB)) MB)...")
+        let startTime = Date()
         let audioPath = try await supabaseService.uploadFile(audioData, fileName: audioFileName, bucket: "user-audio")
+        let audioUploadTime = Date().timeIntervalSince(startTime)
+        print("✅ Audio upload completed in \(String(format: "%.1f", audioUploadTime)) seconds")
         
         // Step 3: Upload sheet music
         await updateProgress(step: 3)
+        print("📤 Starting sheet music upload (\(String(format: "%.2f", sheetSizeMB)) MB)...")
+        let sheetStartTime = Date()
         let sheetMusicPath = try await supabaseService.uploadFile(sheetMusicData, fileName: sheetMusicFileName, bucket: "user-sheet-music")
+        let sheetUploadTime = Date().timeIntervalSince(sheetStartTime)
+        print("✅ Sheet music upload completed in \(String(format: "%.1f", sheetUploadTime)) seconds")
         
         // Get the public URLs for the uploaded files
         guard let audioURL = supabaseService.getPublicURL(filePath: audioPath, bucket: "user-audio"),
@@ -447,34 +635,80 @@ class BackendService: ObservableObject {
         return (authResult: authResult, audioURL: audioPath, sheetMusicURL: sheetMusicPath)
     }
     
+    private func getNetworkType() -> String {
+        let monitor = NWPathMonitor()
+        let semaphore = DispatchSemaphore(value: 0)
+        var networkType = "Unknown"
+        
+        monitor.pathUpdateHandler = { path in
+            if path.usesInterfaceType(.wifi) {
+                networkType = "WiFi"
+            } else if path.usesInterfaceType(.cellular) {
+                networkType = "Cellular"
+            } else if path.usesInterfaceType(.wiredEthernet) {
+                networkType = "Ethernet"
+            } else {
+                networkType = "Unknown"
+            }
+            semaphore.signal()
+        }
+        
+        let queue = DispatchQueue(label: "NetworkMonitor")
+        monitor.start(queue: queue)
+        _ = semaphore.wait(timeout: .now() + 1)
+        monitor.cancel()
+        
+        return networkType
+    }
+    
     private func callAnalyzeEndpoint(audioPath: String, sheetMusicPath: String) async throws -> AnalysisResult {
         let url = URL(string: "\(BackendConfig.baseURL)/analyze/")!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 240.0 // 4 minutes for analysis
         
         let requestBody = [
             "audio_url": audioPath,
-            "sheet_music_url": sheetMusicPath
+            "sheet_music_url": sheetMusicPath,
+            "cache_buster": UUID().uuidString,  // Add unique identifier to prevent caching
+            "timestamp": String(Int(Date().timeIntervalSince1970))
         ]
         
         request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
         
-        let (data, response) = try await URLSession.shared.data(for: request)
-        
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw BackendError.networkError
-        }
-        
-        if httpResponse.statusCode == 200 {
-            let analysisResult = try JSONDecoder().decode(AnalysisResult.self, from: data)
-            return analysisResult
-        } else {
-            print("❌ Backend returned status: \(httpResponse.statusCode)")
-            if let errorData = String(data: data, encoding: .utf8) {
-                print("❌ Backend error: \(errorData)")
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            
+            guard let httpResponse = response as? HTTPURLResponse else {
+                throw BackendError.networkError
             }
-            throw BackendError.serverError
+            
+            if httpResponse.statusCode == 200 {
+                let analysisResult = try JSONDecoder().decode(AnalysisResult.self, from: data)
+                return analysisResult
+            } else {
+                print("❌ Backend returned status: \(httpResponse.statusCode)")
+                if let errorData = String(data: data, encoding: .utf8) {
+                    print("❌ Backend error: \(errorData)")
+                }
+                throw BackendError.serverError
+            }
+        } catch let urlError as URLError {
+            print("❌ URL Error: \(urlError)")
+            switch urlError.code {
+            case .timedOut:
+                throw BackendError.timeoutError
+            case .notConnectedToInternet, .networkConnectionLost:
+                throw BackendError.networkConnectionError
+            case .cannotConnectToHost, .cannotFindHost:
+                throw BackendError.serverUnreachableError
+            default:
+                throw BackendError.networkError
+            }
+        } catch {
+            print("❌ Unexpected error: \(error)")
+            throw BackendError.networkError
         }
     }
 }
@@ -530,6 +764,9 @@ enum BackendError: Error, LocalizedError {
     case serverError
     case invalidResponse
     case fileUploadError
+    case timeoutError
+    case networkConnectionError
+    case serverUnreachableError
     
     var errorDescription: String? {
         switch self {
@@ -541,6 +778,12 @@ enum BackendError: Error, LocalizedError {
             return "Invalid response from server"
         case .fileUploadError:
             return "File upload failed"
+        case .timeoutError:
+            return "Analysis failed: the request timed out. Please check your internet connection and try again."
+        case .networkConnectionError:
+            return "Analysis failed: the network connection was lost. Please check your internet connection and try again."
+        case .serverUnreachableError:
+            return "Analysis failed: couldn't connect to server. The server may be temporarily unavailable. Please try again later."
         }
     }
 }
@@ -661,6 +904,11 @@ class DataManager: ObservableObject {
         print("📊 Updating user stats...")
         print("🔢 Found \(practiceSessions.count) practice sessions")
         
+        // Debug: Print all sessions with details
+        for (index, session) in practiceSessions.enumerated() {
+            print("   Session \(index + 1): \(session.pieceTitle ?? "Untitled") - \(String(format: "%.1f", session.accuracy))% - \(session.date)")
+        }
+        
         profile.totalSessions = practiceSessions.count
         profile.totalPracticeTime = practiceSessions.reduce(0) { $0 + $1.duration }
         
@@ -675,36 +923,165 @@ class DataManager: ObservableObject {
             print("   Total Practice Time: \(String(format: "%.1f", profile.totalPracticeTime)) seconds")
         } else {
             print("📝 No practice sessions found - stats remain at defaults")
+            profile.averageAccuracy = 0.0
+            profile.bestAccuracy = 0.0
         }
         
-        // Calculate consecutive practice days streak
+        // Calculate consecutive practice days streak - improved logic
         let sortedSessions = practiceSessions.sorted { $0.date > $1.date }
         var streak = 0
         let calendar = Calendar.current
-        var currentDate = Date()
+        let today = calendar.startOfDay(for: Date())
         
         // Get unique practice days (remove duplicates from same day)
         let uniquePracticeDays = Array(Set(sortedSessions.map { calendar.startOfDay(for: $0.date) })).sorted(by: >)
         
-        for practiceDay in uniquePracticeDays {
-            if calendar.isDate(practiceDay, inSameDayAs: currentDate) || 
-               calendar.isDate(practiceDay, inSameDayAs: calendar.date(byAdding: .day, value: -1, to: currentDate) ?? currentDate) {
-                streak += 1
-                currentDate = calendar.date(byAdding: .day, value: -1, to: currentDate) ?? currentDate
-        } else {
+        print("🗓️ Unique practice days: \(uniquePracticeDays.count)")
+        for (index, day) in uniquePracticeDays.enumerated() {
+            print("   Day \(index + 1): \(day)")
+        }
+        
+        // Calculate streak by checking consecutive days from today backwards
+        var checkDate = today
+        var consecutiveDays = 0
+        
+        print("🔥 Starting streak calculation from today: \(today)")
+        
+        for (index, practiceDay) in uniquePracticeDays.enumerated() {
+            let daysBetween = calendar.dateComponents([.day], from: practiceDay, to: checkDate).day ?? 0
+            
+            print("🔥 Day \(index + 1): \(practiceDay), Days between: \(daysBetween)")
+            
+            // If this practice day is exactly consecutive (0 or 1 day difference)
+            if daysBetween <= 1 {
+                consecutiveDays += 1
+                print("✅ Consecutive day found! Streak: \(consecutiveDays)")
+                checkDate = calendar.date(byAdding: .day, value: -1, to: practiceDay) ?? practiceDay
+                print("🔥 Next check date: \(checkDate)")
+            } else {
+                // Gap found, streak ends
+                print("❌ Gap found (days between: \(daysBetween)), streak ends at \(consecutiveDays)")
                 break
             }
         }
+        
+        streak = consecutiveDays
+        print("🔥 Final streak calculation: \(streak) days")
         
         profile.currentStreak = streak
         saveUserProfile(profile)
         
         print("🔥 Current streak: \(streak) days")
+        print("💾 Profile saved with updated stats")
+        
+        // Force UI update
+        DispatchQueue.main.async {
+            self.userProfile = profile
+        }
+    }
+    
+    // Force refresh stats from all sources
+    private var isRefreshing = false
+    
+    func forceRefreshStats() {
+        guard !isRefreshing else {
+            print("⚠️ Force refresh already in progress, skipping...")
+            return
+        }
+        
+        isRefreshing = true
+        print("🔄 Force refreshing stats...")
+        
+        // First update from current sessions
+        updateUserStats()
+        
+        // Then reload from Supabase to ensure we have latest data
+        Task {
+            do {
+                let userId = UserDefaults.standard.string(forKey: "currentUserId") ?? ""
+                if !userId.isEmpty {
+                    let supabaseSessions = try await supabaseService.fetchUserSessions(userId: userId)
+                    await MainActor.run {
+                        print("🔄 Force refresh: Got \(supabaseSessions.count) sessions from Supabase")
+                        
+                        // Debug: Print first session details
+                        if let firstSession = supabaseSessions.first {
+                            print("🔍 First session details:")
+                            print("   ID: \(firstSession.id)")
+                            print("   Date: '\(firstSession.date)'")
+                            print("   Accuracy: \(firstSession.accuracy ?? 0)")
+                            print("   Title: '\(firstSession.pieceTitle ?? "nil")'")
+                            print("   User ID: \(firstSession.userId)")
+                        }
+                        
+                        // Convert and update sessions
+                        let convertedSessions: [PracticeSession] = supabaseSessions.compactMap { backendSession -> PracticeSession? in
+                            print("🔄 Converting session: \(backendSession.id)")
+                            print("   Date string: '\(backendSession.date)'")
+                            print("   Accuracy: \(backendSession.accuracy ?? 0)")
+                            print("   Title: '\(backendSession.pieceTitle ?? "nil")'")
+                            
+                            // Try multiple date formats since Supabase might return different formats
+                            let formatter1 = ISO8601DateFormatter()
+                            let formatter2 = DateFormatter()
+                            formatter2.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSZ"
+                            
+                            var date: Date?
+                            if let parsedDate = formatter1.date(from: backendSession.date) {
+                                date = parsedDate
+                            } else if let parsedDate = formatter2.date(from: backendSession.date) {
+                                date = parsedDate
+                            } else {
+                                // Try a more flexible ISO8601 formatter
+                                let flexibleFormatter = ISO8601DateFormatter()
+                                flexibleFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                                date = flexibleFormatter.date(from: backendSession.date)
+                            }
+                            
+                            guard let validDate = date else {
+                                print("❌ Failed to parse date with any formatter: '\(backendSession.date)'")
+                                return nil
+                            }
+                            
+                            print("✅ Date parsed successfully: \(validDate)")
+                            
+                            let practiceSession = PracticeSession.fromBackendSession(backendSession, date: validDate)
+                            print("✅ Session converted successfully")
+                            return practiceSession
+                        }
+                        
+                        // Debug: Print all session IDs before replacement
+                        print("🔍 Sessions before replacement: \(self.practiceSessions.count)")
+                        for session in self.practiceSessions {
+                            print("   Existing: \(session.id)")
+                        }
+                        
+                        print("🔍 Converted sessions: \(convertedSessions.count)")
+                        for session in convertedSessions {
+                            print("   New: \(session.id)")
+                        }
+                        
+                        // Replace all sessions with fresh data
+                        self.practiceSessions = convertedSessions.sorted { $0.date > $1.date }
+                        print("📈 Force refresh: Total sessions now \(self.practiceSessions.count)")
+                        
+                        // Update stats again with fresh data
+                        self.updateUserStats()
+                    }
+                }
+            } catch {
+                print("❌ Force refresh failed: \(error)")
+            }
+            
+            // Reset the refreshing flag
+            await MainActor.run {
+                self.isRefreshing = false
+            }
+        }
     }
     
     func loadData() {
         _ = loadUserProfile()
-        loadSessionsFromDisk()
         
         // Create default user profile if none exists
         if userProfile == nil {
@@ -716,8 +1093,8 @@ class DataManager: ObservableObject {
             saveUserProfile(userProfile!)
         }
         
-        // Update user stats after loading local sessions
-        updateUserStats()
+        // Don't load from disk first - let Supabase be the source of truth
+        // This prevents duplicate sessions from disk + Supabase
         
         Task {
             do {
@@ -729,21 +1106,34 @@ class DataManager: ObservableObject {
                     
                     // Convert BackendSession to PracticeSession for stats calculation
                     let convertedSessions: [PracticeSession] = supabaseSessions.compactMap { backendSession -> PracticeSession? in
-                        // Parse date string to Date
-                        let formatter = ISO8601DateFormatter()
-                        guard let date = formatter.date(from: backendSession.date) else {
-                            print("⚠️ Failed to parse date: \(backendSession.date)")
+                        // Parse date string to Date - try multiple formats
+                        let formatter1 = ISO8601DateFormatter()
+                        let formatter2 = DateFormatter()
+                        formatter2.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSZ"
+                        
+                        var date: Date?
+                        if let parsedDate = formatter1.date(from: backendSession.date) {
+                            date = parsedDate
+                        } else if let parsedDate = formatter2.date(from: backendSession.date) {
+                            date = parsedDate
+                        } else {
+                            // Try a more flexible ISO8601 formatter
+                            let flexibleFormatter = ISO8601DateFormatter()
+                            flexibleFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                            date = flexibleFormatter.date(from: backendSession.date)
+                        }
+                        
+                        guard let validDate = date else {
+                            print("⚠️ Failed to parse date with any formatter: \(backendSession.date)")
                             return nil
                         }
                         
-                        return PracticeSession.fromBackendSession(backendSession, date: date)
+                        return PracticeSession.fromBackendSession(backendSession, date: validDate)
                     }
                     
-                    let existingIds = Set(self.practiceSessions.map { $0.id })
-                    let newSessions = convertedSessions.filter { !existingIds.contains($0.id) }
-                    print("🆕 Adding \(newSessions.count) new sessions from Supabase")
-                    self.practiceSessions.append(contentsOf: newSessions)
-                    self.practiceSessions.sort { $0.date > $1.date }
+                    // Replace all sessions with Supabase data (single source of truth)
+                    print("🔄 Replacing all sessions with Supabase data")
+                    self.practiceSessions = convertedSessions.sorted { $0.date > $1.date }
                     print("📈 Total sessions now: \(self.practiceSessions.count)")
                     
                     // Update user stats after loading sessions
@@ -862,6 +1252,8 @@ struct PracticeSession: Codable, Identifiable {
     }
     
     static func fromBackendSession(_ backendSession: BackendSession, date: Date) -> PracticeSession {
+        print("🔄 Creating AnalysisResult for session: \(backendSession.id)")
+        
         // Create a minimal AnalysisResult for the existing initializer
         let analysisResult = AnalysisResult(
             accuracy: backendSession.accuracy ?? 0.0,
@@ -892,6 +1284,8 @@ struct PracticeSession: Codable, Identifiable {
             )
         )
         
+        print("✅ AnalysisResult created successfully")
+        
         // Create PracticeSession using existing initializer
         let practiceSession = PracticeSession(
             userId: backendSession.userId,
@@ -901,6 +1295,8 @@ struct PracticeSession: Codable, Identifiable {
             duration: backendSession.duration ?? 0.0,
             pieceTitle: backendSession.pieceTitle
         )
+        
+        print("✅ PracticeSession created successfully with ID: \(practiceSession.id)")
         
         // Since we can't modify let properties, we need to return a new instance
         // For now, let's just return the created session and handle the ID/date mismatch
@@ -1014,23 +1410,38 @@ struct BackendSession: Codable, Identifiable {
     }
 }
 
+// MARK: - Feedback Data Structure
+struct FeedbackData: Codable {
+    let name: String
+    let email: String
+    let message: String
+    let timestamp: String
+    let app_version: String
+}
+
 // MARK: - Error Types
 enum SupabaseError: Error, LocalizedError {
     case networkError
     case serverError
     case authError(String)
     case notFound(String)
+    case notAuthenticated
+    case sessionExpired
     
     var errorDescription: String? {
         switch self {
         case .networkError:
-            return "Network connection failed"
+            return "❌ Network connection issue. Please check your internet connection (WiFi or Cellular Data) and try again. If you're on cellular, make sure you have a strong signal."
         case .serverError:
-            return "Server error occurred"
+            return "Server error occurred. Please try again in a moment."
         case .authError(let message):
             return message
         case .notFound(let message):
             return message
+        case .notAuthenticated:
+            return "You need to log in to upload files"
+        case .sessionExpired:
+            return "Your session has expired. Please log in again"
         }
     }
 }
@@ -1085,7 +1496,7 @@ class AppState: ObservableObject {
     let supabaseService = SupabaseService.shared
     
     enum AppScreen {
-        case splash, info, onboarding, login, main
+        case splash, info, login, main
     }
     
     init() {
@@ -1098,10 +1509,11 @@ class AppState: ObservableObject {
             print("🔍 Debug - No saved access token found in UserDefaults")
         }
         
-        checkAuthenticationStatus()
+        // Don't check authentication status immediately - let splash screen play first
+        // Authentication will be checked after splash screen completes
     }
     
-    private func checkAuthenticationStatus() {
+    func checkAuthenticationStatus() {
         // Check if user has a valid access token and profile
         if let savedToken = UserDefaults.standard.string(forKey: "supabaseAccessToken"),
            !savedToken.isEmpty,
@@ -1220,28 +1632,23 @@ struct ContentView: View {
     var body: some View {
         Group {
             switch appState.currentScreen {
-            case .splash:
-                SplashScreen(appState: appState)
-            case .info:
-                TechnologyInfoScreen(appState: appState)
-            case .onboarding:
-                OnboardingScreen(appState: appState)
-            case .login:
-                LoginScreen(appState: appState)
-            case .main:
-                MainTabView(appState: appState)
+                case .splash:
+                    SplashScreen(appState: appState)
+                case .info:
+                    TechnologyInfoScreen(appState: appState)
+                case .login:
+                    LoginScreen(appState: appState)
+                case .main:
+                    MainTabView(appState: appState)
             }
         }
         .animation(.easeInOut(duration: 0.5), value: appState.currentScreen)
         .onChange(of: scenePhase) { phase in
-            if phase == .active && appState.currentScreen != .splash {
-                // Show splash screen every time app becomes active
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                    appState.showSplashScreen()
+            if phase == .active {
+                if appState.currentScreen == .main {
+                    // Only refresh stats when app becomes active, don't show splash
+                    appState.dataManager.forceRefreshStats()
                 }
-            } else if phase == .active {
-                // Refresh stats when app becomes active
-                appState.dataManager.updateUserStats()
             }
         }
     }
@@ -1388,8 +1795,12 @@ struct SplashScreen: View {
             }
         }
         
-        // Navigate to appropriate screen based on login state
+        // Check authentication status after splash animation, then navigate
         DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
+            // First check authentication status
+            appState.checkAuthenticationStatus()
+            
+            // Then navigate based on the result
             withAnimation {
                 if appState.isLoggedIn {
                     appState.currentScreen = .main
@@ -1495,7 +1906,7 @@ struct TechnologyInfoScreen: View {
                         // Mark that user has seen the info screen
                         UserDefaults.standard.set(true, forKey: "hasSeenInfoScreen")
                 withAnimation {
-                    appState.currentScreen = .onboarding
+                    appState.currentScreen = .login
                 }
                     }) {
                         Text("Skip")
@@ -1516,7 +1927,7 @@ struct TechnologyInfoScreen: View {
                             // Mark that user has seen the info screen
                             UserDefaults.standard.set(true, forKey: "hasSeenInfoScreen")
                             withAnimation {
-                                appState.currentScreen = .onboarding
+                                appState.currentScreen = .login
                             }
                         }
                     }) {
@@ -1613,9 +2024,16 @@ struct InfoPageView: View {
             Spacer()
         }
         .onAppear {
-            withAnimation {
-                animateIcon = true
-                animateText = true
+            // Reset animations first
+            animateIcon = false
+            animateText = false
+            
+            // Then animate in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                withAnimation {
+                    animateIcon = true
+                    animateText = true
+                }
             }
         }
     }
@@ -1628,126 +2046,6 @@ struct InfoPage {
     let description: String
 }
 
-// MARK: - Onboarding Screen
-struct OnboardingScreen: View {
-    @ObservedObject var appState: AppState
-    @State private var currentPage = 0
-    
-    let onboardingPages = [
-        OnboardingPage(
-            icon: "music.note.list",
-            title: "AI-Powered Analysis",
-            description: "Get instant feedback on your piano performance with advanced AI technology"
-        ),
-        OnboardingPage(
-            icon: "chart.bar.fill",
-            title: "Detailed Insights",
-            description: "See exactly which notes you missed and get specific practice recommendations"
-        ),
-        OnboardingPage(
-            icon: "person.fill.checkmark",
-            title: "Track Progress",
-            description: "Monitor your improvement over time with detailed performance analytics"
-        )
-    ]
-    
-    var body: some View {
-        ZStack {
-            Color.black
-                .ignoresSafeArea()
-            
-            VStack {
-                HStack {
-                    ForEach(0..<onboardingPages.count, id: \.self) { index in
-                        Circle()
-                            .fill(index == currentPage ? Color.purple : Color.white.opacity(0.3))
-                            .frame(width: 8, height: 8)
-                    }
-                }
-                .padding(.top, 50)
-                
-                Spacer()
-                
-                TabView(selection: $currentPage) {
-                    ForEach(0..<onboardingPages.count, id: \.self) { index in
-                        OnboardingPageView(page: onboardingPages[index])
-                    }
-                }
-                .tabViewStyle(PageTabViewStyle(indexDisplayMode: .never))
-                
-                Spacer()
-                
-                HStack {
-                    if currentPage > 0 {
-                                            Button("Back") {
-                        withAnimation {
-                            currentPage -= 1
-                        }
-                    }
-                    .foregroundColor(.white)
-                    .padding()
-                    .background(Color.gray.opacity(0.3))
-                    .cornerRadius(12)
-                    }
-                    
-                    Spacer()
-                    
-                    Button(currentPage == onboardingPages.count - 1 ? "Get Started" : "Next") {
-                        if currentPage == onboardingPages.count - 1 {
-                            withAnimation {
-                                appState.currentScreen = .login
-                            }
-                        } else {
-                            withAnimation {
-                                currentPage += 1
-                            }
-                        }
-                    }
-                    .foregroundColor(.white)
-                    .padding()
-                    .background(Color.purple)
-                    .cornerRadius(12)
-                    .shadow(color: Color.purple.opacity(0.5), radius: 10, x: 0, y: 5)
-                }
-                .padding(.horizontal, 30)
-                .padding(.bottom, 50)
-            }
-        }
-    }
-}
-
-struct OnboardingPage {
-    let icon: String
-    let title: String
-    let description: String
-}
-
-struct OnboardingPageView: View {
-    let page: OnboardingPage
-    
-    var body: some View {
-        VStack(spacing: 30) {
-            Image(systemName: page.icon)
-                .font(.system(size: 80))
-                .foregroundColor(.purple)
-                .shadow(color: Color.purple.opacity(0.3), radius: 10, x: 0, y: 5)
-            
-            VStack(spacing: 16) {
-                Text(page.title)
-                    .font(.title)
-                    .fontWeight(.bold)
-                    .foregroundColor(.white)
-                
-                Text(page.description)
-                    .font(.body)
-                    .multilineTextAlignment(.center)
-                    .foregroundColor(.white.opacity(0.7))
-                    .padding(.horizontal, 40)
-            }
-        }
-        .padding()
-    }
-}
 
 // MARK: - Login Screen
 struct LoginScreen: View {
@@ -1792,14 +2090,16 @@ struct LoginScreen: View {
                             CustomTextField(
                                 text: $email,
                                 placeholder: "Email",
-                                icon: "envelope.fill"
+                                icon: "envelope.fill",
+                                textColor: .white
                             )
                             
                             if isSignUp {
                                 CustomTextField(
                                     text: $name,
                                     placeholder: "Full Name",
-                                    icon: "person.fill"
+                                    icon: "person.fill",
+                                    textColor: .white
                                 )
                                 .transition(.asymmetric(
                                     insertion: .opacity.combined(with: .move(edge: .top)),
@@ -2186,6 +2486,7 @@ struct CustomTextField: View {
     let placeholder: String
     let icon: String
     var isSecure: Bool = false
+    var textColor: Color = .black
     
     var body: some View {
         HStack {
@@ -2202,12 +2503,14 @@ struct CustomTextField: View {
                 
                 if isSecure {
                     SecureField("", text: $text)
-                        .foregroundColor(.white)
+                        .foregroundColor(textColor)
                         .accentColor(.purple)
+                        .colorScheme(textColor == .black ? .light : .dark)
                 } else {
                     TextField("", text: $text)
-                        .foregroundColor(.white)
+                        .foregroundColor(textColor)
                         .accentColor(.purple)
+                        .colorScheme(textColor == .black ? .light : .dark)
                 }
             }
         }
@@ -2542,8 +2845,8 @@ struct ModernStatsCards: View {
         .cornerRadius(16)
         .padding(.horizontal)
         .onAppear {
-            // Refresh stats when the cards appear
-            appState.dataManager.updateUserStats()
+            // Force refresh stats when the cards appear
+            appState.dataManager.forceRefreshStats()
         }
     }
 }
@@ -2655,6 +2958,8 @@ struct PracticeScreen: View {
     @State private var isLoadingHistory = false
     @State private var loadingTextIndex = 0
     @State private var loadingTextTimer: Timer?
+    @State private var glowAnimation = false
+    @State private var showingUploadGuide = false
     
     private let loadingMessages = [
         "Starting Analysis...",
@@ -2670,77 +2975,140 @@ struct PracticeScreen: View {
     ]
     
     var body: some View {
-        NavigationView {
-            ZStack {
-                backgroundGradient
-                
-                ScrollView {
-                    VStack(spacing: 24) {
-                        VStack(spacing: 8) {
-                            Text("Practice")
-                                .font(.system(size: 28, weight: .bold, design: .rounded))
-                                .foregroundStyle(
-                                    LinearGradient(
-                                        gradient: Gradient(colors: [Color.purple, Color.blue]),
-                                        startPoint: .leading,
-                                        endPoint: .trailing
-                                    )
+        ZStack {
+            backgroundGradient
+            
+            // Scrollable Content
+            ScrollView {
+                VStack(spacing: 16) {
+                    // Header (now scrollable)
+                    ZStack {
+                        // Centered Practice Text
+                        Text("Practice")
+                            .font(.system(size: 28, weight: .bold, design: .rounded))
+                            .foregroundStyle(
+                                LinearGradient(
+                                    gradient: Gradient(colors: [Color.purple, Color.blue]),
+                                    startPoint: .leading,
+                                    endPoint: .trailing
                                 )
-                            
-                            Text("Record and analyze your performance")
-                                .font(.subheadline)
-                                .foregroundColor(.white.opacity(0.7))
-                        }
-                        .padding(.top)
-                        
-                        RecordingSection(
-                            isRecording: $isRecording,
-                            selectedAudioURL: $selectedAudioURL
-                        )
-                        
-                        SheetMusicSection(
-                            selectedSheetMusicURL: $selectedSheetMusicURL,
-                            showingImagePicker: $showingFilePicker
-                        )
-                        
-                        if selectedAudioURL != nil && selectedSheetMusicURL != nil {
-                            AnalysisButton(
-                                isAnalyzing: $isAnalyzing,
-                                analysisResult: $analysisResult,
-                                showingResults: $showingResults,
-                                audioURL: selectedAudioURL!,
-                                sheetMusicURL: selectedSheetMusicURL!,
-                                appState: appState
                             )
-                        }
                         
-                        PracticeTipsSection()
-                        
-                        RecentSessionsSection(
-                            sessions: recentSessions,
-                            isLoading: isLoadingHistory,
-                            onSessionTap: { session in
-                                if let analysisResult = session.toAnalysisResult() {
-                                    self.analysisResult = analysisResult
-                                    self.showingResults = true
+                        // Glowing Info Button (positioned on the right)
+                        HStack {
+                            Spacer()
+                            
+                            ZStack {
+                                // Glow effect (visual only, not tappable)
+                                Circle()
+                                    .fill(
+                                        RadialGradient(
+                                            gradient: Gradient(colors: [
+                                                Color.yellow.opacity(0.3),
+                                                Color.green.opacity(0.2),
+                                                Color.clear
+                                            ]),
+                                            center: .center,
+                                            startRadius: 5,
+                                            endRadius: 25
+                                        )
+                                    )
+                                    .scaleEffect(glowAnimation ? 1.2 : 1.0)
+                                    .animation(
+                                        .easeInOut(duration: 1.5)
+                                        .repeatForever(autoreverses: true),
+                                        value: glowAnimation
+                                    )
+                                    .allowsHitTesting(false)  // Make glow non-interactive
+                                
+                                // Button (only this is tappable)
+                                Button(action: { showingUploadGuide = true }) {
+                                    Image(systemName: "info.circle.fill")
+                                        .font(.title2)
+                                        .foregroundColor(.yellow)
+                                        .shadow(color: .yellow.opacity(0.6), radius: 5)
                                 }
-                            },
-                            onViewAll: {
-                                withAnimation(.easeInOut(duration: 0.3)) {
-                                    selectedTab = 2
-                                }
+                                .buttonStyle(PlainButtonStyle())
                             }
-                        )
+                            .onAppear {
+                                glowAnimation = true
+                            }
+                            .frame(width: 40, height: 40)  // Constrain the button size
+                        }
                     }
                     .padding(.horizontal, 20)
-                    .padding(.bottom, 40)
-                    .refreshable {
-                        await loadRecentSessionsAsync()
+                    .padding(.top, 10)
+                    .padding(.bottom, 8)
+                    
+                    VStack(spacing: 8) {
+                        Text("Record and analyze your performance")
+                            .font(.subheadline)
+                            .foregroundColor(.white.opacity(0.7))
+                        
+                        // Accuracy Disclaimer
+                        VStack(spacing: 8) {
+                            Text("*GraceAI may have errors and may not be 100% accurate")
+                                .font(.caption)
+                                .foregroundColor(.yellow.opacity(0.8))
+                                .multilineTextAlignment(.center)
+                            
+                            Text("To increase GraceAI's accuracy, please upload up to nearly 15 measures of music")
+                                .font(.caption)
+                                .foregroundColor(.white.opacity(0.6))
+                                .multilineTextAlignment(.center)
+                        }
+                        .padding(.horizontal, 20)
                     }
+                    
+                    RecordingSection(
+                        isRecording: $isRecording,
+                        selectedAudioURL: $selectedAudioURL
+                    )
+                    
+                    SheetMusicSection(
+                        selectedSheetMusicURL: $selectedSheetMusicURL,
+                        showingImagePicker: $showingFilePicker
+                    )
+                    
+                    if selectedAudioURL != nil && selectedSheetMusicURL != nil {
+                        AnalysisButton(
+                            isAnalyzing: $isAnalyzing,
+                            analysisResult: $analysisResult,
+                            showingResults: $showingResults,
+                            audioURL: selectedAudioURL!,
+                            sheetMusicURL: selectedSheetMusicURL!,
+                            appState: appState
+                        )
+                    }
+                    
+                    PracticeTipsSection()
+                    
+                    RecentSessionsSection(
+                        sessions: recentSessions,
+                        isLoading: isLoadingHistory,
+                        onSessionTap: { session in
+                            if let analysisResult = session.toAnalysisResult() {
+                                self.analysisResult = analysisResult
+                                self.showingResults = true
+                            }
+                        },
+                        onViewAll: {
+                            withAnimation(.easeInOut(duration: 0.3)) {
+                                selectedTab = 2
+                            }
+                        }
+                    )
                 }
-                
-                // Loading overlay
-                if isAnalyzing {
+                .padding(.horizontal, 20)
+                .padding(.top, 20)
+                .padding(.bottom, 40)
+            }
+            .refreshable {
+                await loadRecentSessionsAsync()
+            }
+            
+            // Loading overlay
+            if isAnalyzing {
                     Color.black.opacity(0.7)
                         .ignoresSafeArea()
                         .transition(.opacity)
@@ -2775,9 +3143,6 @@ struct PracticeScreen: View {
                     )
                     .transition(.scale.combined(with: .opacity))
                 }
-            }
-            .navigationTitle("")
-            .navigationBarHidden(true)
         }
         .background(
             NavigationLink(
@@ -2789,7 +3154,7 @@ struct PracticeScreen: View {
                         )
                     } else {
                         VStack {
-                            Text("No authResults available")
+                            Text("No results available")
                                 .foregroundColor(.white)
                                 .font(.title2)
                             
@@ -2822,6 +3187,9 @@ struct PracticeScreen: View {
             } else {
                 stopLoadingTextAnimation()
             }
+        }
+        .sheet(isPresented: $showingUploadGuide) {
+            UploadInstructionsView()
         }
     }
     
@@ -3157,13 +3525,40 @@ struct RecordingSection: View {
                 }
                 .buttonStyle(PressableButtonStyle())
                 
-                if selectedAudioURL != nil {
-                    HStack {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundColor(.green)
-                        Text("Audio file selected")
-                            .foregroundColor(.white)
-                        Spacer()
+                if let audioURL = selectedAudioURL {
+                    VStack(spacing: 8) {
+                        HStack {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundColor(.green)
+                            Text("Audio file selected")
+                                .foregroundColor(.white)
+                                .font(.subheadline)
+                                .fontWeight(.medium)
+                            Spacer()
+                        }
+                        
+                        HStack {
+                            Image(systemName: "waveform")
+                                .foregroundColor(.blue)
+                            Text(audioURL.lastPathComponent)
+                                .foregroundColor(.white.opacity(0.9))
+                                .font(.caption)
+                                .lineLimit(1)
+                            Spacer()
+                            
+                            Button(action: { selectedAudioURL = nil }) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "trash.fill")
+                                    Text("Remove")
+                                }
+                                .font(.caption)
+                                .foregroundColor(.white)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 6)
+                                .background(Color.red.opacity(0.8))
+                                .cornerRadius(8)
+                            }
+                        }
                     }
                 }
             }
@@ -3326,13 +3721,40 @@ struct SheetMusicSection: View {
                 }
                 .buttonStyle(PressableButtonStyle())
                 
-                if selectedSheetMusicURL != nil {
-                    HStack {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundColor(.green)
-                        Text("Sheet music uploaded")
-                            .foregroundColor(.white)
-                        Spacer()
+                if let sheetMusicURL = selectedSheetMusicURL {
+                    VStack(spacing: 8) {
+                        HStack {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundColor(.green)
+                            Text("Sheet Music selected")
+                                .foregroundColor(.white)
+                                .font(.subheadline)
+                                .fontWeight(.medium)
+                            Spacer()
+                        }
+                        
+                        HStack {
+                            Image(systemName: "doc.text.fill")
+                                .foregroundColor(.purple)
+                            Text(sheetMusicURL.lastPathComponent)
+                                .foregroundColor(.white.opacity(0.9))
+                                .font(.caption)
+                                .lineLimit(1)
+                            Spacer()
+                            
+                            Button(action: { selectedSheetMusicURL = nil }) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "trash.fill")
+                                    Text("Remove")
+                                }
+                                .font(.caption)
+                                .foregroundColor(.white)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 6)
+                                .background(Color.red.opacity(0.8))
+                                .cornerRadius(8)
+                            }
+                        }
                     }
                 }
             }
@@ -3379,23 +3801,49 @@ struct DocumentPicker: UIViewControllerRepresentable {
         }
         
         func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-            guard let url = urls.first else { return }
+            guard let url = urls.first else { 
+                print("❌ No file selected")
+                return 
+            }
+            
+            print("✅ File selected: \(url.lastPathComponent)")
+            
+            // Start accessing the security-scoped resource
+            let accessing = url.startAccessingSecurityScopedResource()
+            defer {
+                if accessing {
+                    url.stopAccessingSecurityScopedResource()
+                }
+            }
             
             let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-            let fileName = url.lastPathComponent
+            let fileName = url.lastPathComponent // Keep original file name
             let destinationURL = documentsPath.appendingPathComponent(fileName)
             
             do {
+                // Remove existing file if it exists
                 if FileManager.default.fileExists(atPath: destinationURL.path) {
                     try FileManager.default.removeItem(at: destinationURL)
                 }
+                
+                // Copy the file
                 try FileManager.default.copyItem(at: url, to: destinationURL)
-                parent.selectedURL = destinationURL
+                print("✅ File copied successfully to: \(destinationURL.lastPathComponent)")
+                
+                // Update the selected URL on main thread
+                DispatchQueue.main.async {
+                    self.parent.selectedURL = destinationURL
+                    print("✅ selectedSheetMusicURL updated: \(destinationURL.lastPathComponent)")
+                }
+                
             } catch {
-                print("Error copying file: \(error)")
+                print("❌ Error copying file: \(error)")
+                print("❌ Error details: \(error.localizedDescription)")
             }
             
-            parent.dismiss()
+            DispatchQueue.main.async {
+                self.parent.dismiss()
+            }
         }
     }
 }
@@ -3415,7 +3863,11 @@ struct AnalysisButton: View {
     
     var body: some View {
         VStack(spacing: 12) {
-            Button(action: {}) {
+            Button(action: {
+                if !isAnalyzing {
+                    performAnalysis()
+                }
+            }) {
                 HStack(spacing: 12) {
                     if isAnalyzing {
                         ProgressView()
@@ -3432,11 +3884,7 @@ struct AnalysisButton: View {
                             .font(.headline)
                             .fontWeight(.semibold)
                         
-                        if !isAnalyzing {
-                            Text("(hold)")
-                                .font(.caption)
-                                .opacity(0.7)
-                        } else if isAnalyzing {
+                        if isAnalyzing {
                             Text("Please wait while we process your performance")
                                 .font(.caption)
                                 .opacity(0.8)
@@ -3468,9 +3916,7 @@ struct AnalysisButton: View {
                 .scaleEffect(isAnalyzing ? 0.98 : 1.0)
                 .animation(.easeInOut(duration: 0.2), value: isAnalyzing)
             }
-            .buttonStyle(HoldToActivateButtonStyle {
-                performAnalysis()
-            })
+            .buttonStyle(PressableButtonStyle())
             .disabled(isAnalyzing)
             
             if isAnalyzing {
@@ -3559,6 +4005,20 @@ struct AnalysisButton: View {
                             
                             try await SupabaseService.shared.saveSession(session)
                             print("✅ Session saved to Supabase")
+                            
+                            // Also save to local data manager for streak calculation
+                            await MainActor.run {
+                                let practiceSession = PracticeSession(
+                                    userId: session.userId,
+                                    audioFileName: session.audioFileName ?? "unknown_audio.m4a",
+                                    sheetMusicFileName: session.sheetMusicFileName ?? "unknown_sheet.pdf",
+                                    analysisResult: authResult,
+                                    duration: session.duration ?? 120.0,
+                                    pieceTitle: session.pieceTitle
+                                )
+                                appState.dataManager.savePracticeSession(practiceSession)
+                                print("✅ Session saved to local data manager")
+                            }
                         } catch {
                             print("❌ Failed to save session to Supabase: \(error)")
                         }
@@ -3569,7 +4029,23 @@ struct AnalysisButton: View {
             } catch {
                 await MainActor.run {
                     print("❌ Analysis failed with error: \(error)")
-                    errorMessage = "Analysis failed: \(error.localizedDescription)"
+                    
+                    // Handle specific authentication errors
+                    if let supabaseError = error as? SupabaseError {
+                        switch supabaseError {
+                        case .notAuthenticated, .sessionExpired:
+                            errorMessage = "Please log in again to upload files. Your session may have expired."
+                            // Optionally trigger logout or redirect to login
+                            appState.logout()
+                        default:
+                            errorMessage = "Upload failed: \(supabaseError.localizedDescription)"
+                        }
+                    } else if let backendError = error as? BackendError {
+                        errorMessage = backendError.localizedDescription
+                    } else {
+                        errorMessage = "Analysis failed: \(error.localizedDescription)"
+                    }
+                    
                     showingError = true
                     isAnalyzing = false
                 }
@@ -3580,8 +4056,6 @@ struct AnalysisButton: View {
 
 // MARK: - Practice Tips Section
 struct PracticeTipsSection: View {
-    @State private var showingInstructions = false
-    
     var body: some View {
         VStack(spacing: 16) {
             HStack {
@@ -3591,13 +4065,6 @@ struct PracticeTipsSection: View {
                     .font(.headline)
                     .foregroundColor(.white)
                 Spacer()
-                
-                Button(action: { showingInstructions = true }) {
-                    Image(systemName: "info.circle.fill")
-                        .foregroundColor(.purple)
-                        .font(.title3)
-                }
-                .buttonStyle(PlainButtonStyle())
             }
             
             VStack(alignment: .leading, spacing: 12) {
@@ -3610,9 +4077,6 @@ struct PracticeTipsSection: View {
         .padding()
         .background(Color.gray.opacity(0.2))
         .cornerRadius(16)
-        .sheet(isPresented: $showingInstructions) {
-            UploadInstructionsView()
-        }
     }
 }
 
@@ -3817,7 +4281,7 @@ struct UploadInstructionsView: View {
                                 .fontWeight(.bold)
                                 .foregroundColor(.white)
                             
-                            Text("Follow these steps to get the best authResults")
+                            Text("Follow these steps to get the best results")
                                 .font(.subheadline)
                                 .foregroundColor(.white.opacity(0.7))
                         }
@@ -3832,7 +4296,7 @@ struct UploadInstructionsView: View {
                                 "3. Tap the 3 dots (⋯) next to your recording",
                                 "4. Select 'Save to Files'",
                                 "5. Choose a location (iCloud Drive recommended)",
-                                "6. Come back to GraceAI and tap 'Select Voice Memo'"
+                                "6. Come back to GraceAI and tap 'Select Audio File'"
                             ]
                         )
                         
@@ -3860,7 +4324,7 @@ struct UploadInstructionsView: View {
                             }
                             
                             VStack(alignment: .leading, spacing: 12) {
-                                TipRow(icon: "mic.fill", title: "Audio Quality", description: "Record in a quiet room for best authResults")
+                                TipRow(icon: "mic.fill", title: "Audio Quality", description: "Record in a quiet room for best results")
                                 TipRow(icon: "camera.fill", title: "Photo Quality", description: "Ensure sheet music is well-lit and in focus")
                                 TipRow(icon: "doc.text.fill", title: "PDF Format", description: "PDF format works best for analysis")
                             }
@@ -3940,7 +4404,7 @@ struct FAQView: View {
         ),
         FAQItem(
             question: "How accurate is the AI analysis?",
-            answer: "The AI provides detailed feedback on note accuracy, timing, and tempo. For best authResults, record in a quiet environment and ensure your sheet music is clear and complete."
+            answer: "The AI provides detailed feedback on note accuracy, timing, and tempo. For best results, record in a quiet environment and ensure your sheet music is clear and complete."
         ),
         FAQItem(
             question: "Can I practice without sheet music?",
@@ -3951,7 +4415,7 @@ struct FAQView: View {
             answer: "Analysis typically takes 30-60 seconds depending on the length of your recording and complexity of the piece. The app will show you progress updates during the process."
         ),
         FAQItem(
-            question: "What if my analysis authResults seem wrong?",
+            question: "What if my analysis results seem wrong?",
             answer: "Check that your audio recording is clear and the sheet music matches what you played. Try re-recording in a quieter environment or with clearer sheet music images."
         ),
         FAQItem(
@@ -4902,10 +5366,11 @@ struct ProfileStats: View {
                 icon: (appState.userProfile?.currentStreak ?? 0) > 0 ? "flame.fill" : "flame",
                 isActive: (appState.userProfile?.currentStreak ?? 0) > 0
             )
+            
         }
         .onAppear {
-            // Refresh stats when profile tab is viewed
-            appState.dataManager.updateUserStats()
+            // Force refresh stats when profile tab is viewed
+            appState.dataManager.forceRefreshStats()
         }
     }
 }
@@ -4972,7 +5437,6 @@ struct SettingsSection: View {
             }
             
             VStack(spacing: 0) {
-                SettingsRow(icon: "bell", title: "Notifications", subtitle: "Practice reminders")
                 SettingsRowWithAction(
                     icon: "questionmark.circle", 
                     title: "Help", 
@@ -5106,13 +5570,15 @@ struct ContactSupportView: View {
                             CustomTextField(
                                 text: $name,
                                 placeholder: "Your Name",
-                                icon: "person.fill"
+                                icon: "person.fill",
+                                textColor: .white
                             )
                             
                             CustomTextField(
                                 text: $email,
                                 placeholder: "Your Email",
-                                icon: "envelope.fill"
+                                icon: "envelope.fill",
+                                textColor: .white
                             )
                             
                             VStack(alignment: .leading, spacing: 8) {
@@ -5126,7 +5592,8 @@ struct ContactSupportView: View {
                                     .padding(12)
                                     .background(Color.gray.opacity(0.2))
                                     .cornerRadius(12)
-                                    .foregroundColor(.white)
+                                    .foregroundColor(.black)
+                                    .colorScheme(.light)
                                     .overlay(
                                         RoundedRectangle(cornerRadius: 12)
                                             .stroke(Color.purple.opacity(0.3), lineWidth: 1)
@@ -5218,16 +5685,58 @@ struct ContactSupportView: View {
         
         isSubmitting = true
         
-        // Simulate sending feedback (in a real app, you'd send this to your backend)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-            isSubmitting = false
-            alertMessage = "Thank you for your feedback! We'll get back to you soon at \(email)."
-            showingAlert = true
-            
-            // Reset form
-            name = ""
-            email = ""
-            message = ""
+        Task {
+            do {
+                // Send feedback to darsh@graceai.music via backend
+                try await sendFeedbackToEmail(name: name, email: email, message: message)
+                
+                await MainActor.run {
+                    isSubmitting = false
+                    alertMessage = "Thank you for your feedback! We'll get back to you soon at \(email)."
+                    showingAlert = true
+                    
+                    // Reset form
+                    name = ""
+                    email = ""
+                    message = ""
+                }
+            } catch {
+                await MainActor.run {
+                    isSubmitting = false
+                    alertMessage = "Failed to send feedback. Please try again later."
+                    showingAlert = true
+                    print("❌ Failed to send feedback: \(error)")
+                }
+            }
+        }
+    }
+    
+    private func sendFeedbackToEmail(name: String, email: String, message: String) async throws {
+        // Create feedback data struct
+        let feedbackData = FeedbackData(
+            name: name,
+            email: email,
+            message: message,
+            timestamp: ISO8601DateFormatter().string(from: Date()),
+            app_version: "GraceAI eos1.1"
+        )
+        
+        // Store feedback in Supabase database
+        let response = try await SupabaseService.shared.storeFeedback(feedbackData)
+        print("✅ Feedback stored in database")
+        
+        // Send email notification to darsh@graceai.music via Supabase Edge Function
+        do {
+            print("📧 Attempting to send email via Edge Function...")
+            print("📧 Feedback data: \(feedbackData)")
+            let emailResponse = try await SupabaseService.shared.sendFeedbackEmail(feedbackData)
+            print("✅ Email sent successfully to darsh@graceai.music")
+            print("✅ Edge Function response: \(emailResponse)")
+        } catch {
+            print("❌ Failed to send email via Edge Function: \(error)")
+            print("❌ Error details: \(error.localizedDescription)")
+            // Don't throw error here - feedback is still stored in database
+            // The email can be sent manually from the database if needed
         }
     }
 }
@@ -5387,7 +5896,14 @@ struct QuickPracticeScreen: View {
                                         .foregroundColor(.green)
                                     Text("Audio file selected")
                                         .foregroundColor(.white)
+                                        .font(.caption)
                                     Spacer()
+                                    
+                                    Button("Remove") {
+                                        selectedAudioURL = nil
+                                    }
+                                    .font(.caption)
+                                    .foregroundColor(.red)
                                 }
                                 
                                 Button(action: saveToFiles) {
@@ -5654,6 +6170,7 @@ struct ResultsView: View {
                     VStack(spacing: 24) {
                         headerSection
                         accuracyCard
+                        aiFeedbackSection
                         performanceMetricsSection
                         detectedNotesSection
                         feedbackSection
@@ -5662,7 +6179,6 @@ struct ResultsView: View {
                             missedNotesSection
                         }
                         
-                        aiFeedbackSection
                         practiceRecommendationsSection
                     }
                     .padding(.horizontal, 20)

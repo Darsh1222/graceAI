@@ -435,13 +435,15 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 4H48KSNZXG;
+				DEVELOPMENT_TEAM = FNMT325P7M;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "TuneIn-Cursor-Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = GraceAI;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.education";
-				INFOPLIST_KEY_NSMicrophoneUsageDescription = "This app needs access to the microphone to record your music practice sessions for analysis.";
+				INFOPLIST_KEY_NSCameraUsageDescription = "This app needs access to your camera to capture sheet music photos for analysis.";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "This app needs access to your microphone to record your musical performance for analysis.";
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "This app needs access to your photo library to select sheet music images for analysis.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -452,9 +454,9 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = eos1.1;
-				PRODUCT_BUNDLE_IDENTIFIER = ds.GraceAI;
-				PRODUCT_NAME = GraceAI;
+				MARKETING_VERSION = 1.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.darshsenthil.graceai.master;
+				PRODUCT_NAME = "GraceAI - Master Your Music";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
@@ -468,13 +470,15 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 4H48KSNZXG;
+				DEVELOPMENT_TEAM = FNMT325P7M;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "TuneIn-Cursor-Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = GraceAI;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.education";
-				INFOPLIST_KEY_NSMicrophoneUsageDescription = "This app needs access to the microphone to record your music practice sessions for analysis.";
+				INFOPLIST_KEY_NSCameraUsageDescription = "This app needs access to your camera to capture sheet music photos for analysis.";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "This app needs access to your microphone to record your musical performance for analysis.";
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "This app needs access to your photo library to select sheet music images for analysis.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -485,9 +489,9 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = eos1.1;
-				PRODUCT_BUNDLE_IDENTIFIER = ds.GraceAI;
-				PRODUCT_NAME = GraceAI;
+				MARKETING_VERSION = 1.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.darshsenthil.graceai.master;
+				PRODUCT_NAME = "GraceAI - Master Your Music";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";

@@ -31,7 +31,7 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "25E1E7E22E2982540018D11A"
-               BuildableName = "TuneIn Cursor.app"
+               BuildableName = "GraceAI - Master Your Music.app"
                BlueprintName = "TuneIn Cursor"
                ReferencedContainer = "container:TuneIn Cursor.xcodeproj">
             </BuildableReference>
@@ -66,7 +66,7 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "25E1E7E22E2982540018D11A"
-            BuildableName = "TuneIn Cursor.app"
+            BuildableName = "GraceAI - Master Your Music.app"
             BlueprintName = "TuneIn Cursor"
             ReferencedContainer = "container:TuneIn Cursor.xcodeproj">
          </BuildableReference>
@@ -85,7 +85,7 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "25E1E7E22E2982540018D11A"
-            BuildableName = "TuneIn Cursor.app"
+            BuildableName = "GraceAI - Master Your Music.app"
             BlueprintName = "TuneIn Cursor"
             ReferencedContainer = "container:TuneIn Cursor.xcodeproj">
          </BuildableReference>
