@@ -486,6 +486,25 @@ class SupabaseService: ObservableObject {
             .upsert(dbProfile)
             .execute()
     }
+    
+    func fetchUserProfile(userId: String) async throws -> UserProfile? {
+        print("🔄 Fetching user profile for ID: \(userId)")
+        
+        let response: [UserProfile] = try await client.database
+            .from("profiles")
+            .select()
+            .eq("id", value: userId)
+            .execute()
+            .value
+        
+        if let profile = response.first {
+            print("✅ Fetched user profile: \(profile.name) - Sessions: \(profile.totalSessions), Accuracy: \(profile.averageAccuracy)%")
+            return profile
+        } else {
+            print("⚠️ No user profile found for ID: \(userId)")
+            return nil
+        }
+    }
 }
 
 // MARK: - Backend Service
@@ -1000,12 +1019,17 @@ class DataManager: ObservableObject {
             do {
                 let userId = UserDefaults.standard.string(forKey: "currentUserId") ?? ""
                 if !userId.isEmpty {
-                    let supabaseSessions = try await supabaseService.fetchUserSessions(userId: userId)
+                    // Fetch both sessions and user profile from Supabase
+                    async let supabaseSessions = supabaseService.fetchUserSessions(userId: userId)
+                    async let supabaseProfile = supabaseService.fetchUserProfile(userId: userId)
+                    
+                    let (sessions, profile) = try await (supabaseSessions, supabaseProfile)
+                    
                     await MainActor.run {
-                        print("🔄 Force refresh: Got \(supabaseSessions.count) sessions from Supabase")
+                        print("🔄 Force refresh: Got \(sessions.count) sessions from Supabase")
                         
                         // Debug: Print first session details
-                        if let firstSession = supabaseSessions.first {
+                        if let firstSession = sessions.first {
                             print("🔍 First session details:")
                             print("   ID: \(firstSession.id)")
                             print("   Date: '\(firstSession.date)'")
@@ -1015,7 +1039,7 @@ class DataManager: ObservableObject {
                         }
                         
                         // Convert and update sessions
-                        let convertedSessions: [PracticeSession] = supabaseSessions.compactMap { backendSession -> PracticeSession? in
+                        let convertedSessions: [PracticeSession] = sessions.compactMap { backendSession -> PracticeSession? in
                             print("🔄 Converting session: \(backendSession.id)")
                             print("   Date string: '\(backendSession.date)'")
                             print("   Accuracy: \(backendSession.accuracy ?? 0)")
@@ -1064,6 +1088,15 @@ class DataManager: ObservableObject {
                         // Replace all sessions with fresh data
                         self.practiceSessions = convertedSessions.sorted { $0.date > $1.date }
                         print("📈 Force refresh: Total sessions now \(self.practiceSessions.count)")
+                        
+                        // Update user profile with latest data from Supabase
+                        if let freshProfile = profile {
+                            print("🔄 Updating user profile with Supabase data:")
+                            print("   Sessions: \(freshProfile.totalSessions)")
+                            print("   Accuracy: \(freshProfile.averageAccuracy)%")
+                            self.userProfile = freshProfile
+                            self.saveUserProfile(freshProfile)
+                        }
                         
                         // Update stats again with fresh data
                         self.updateUserStats()
