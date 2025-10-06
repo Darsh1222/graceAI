@@ -11,6 +11,8 @@ import AVFoundation
 import UniformTypeIdentifiers
 import Supabase
 import Network
+import AuthenticationServices
+import CryptoKit
 
 // MARK: - Notification Names
 extension Notification.Name {
@@ -431,16 +433,18 @@ class SupabaseService: ObservableObject {
             let profiles: [UserProfile] = try await client.database
                 .from("profiles")
                 .select()
-                .eq("user_id", value: authResult.user.id.uuidString)
+                .eq("id", value: authResult.user.id.uuidString)
                 .execute()
                 .value
             
             if let dbProfile = profiles.first {
                 // User exists - return existing profile
+                print("✅ Found existing Google user profile: \(dbProfile.name)")
                 return (dbProfile, authResult.accessToken)
             }
         } catch {
             // Profile not found, will create one below
+            print("⚠️ Could not fetch existing Google profile: \(error)")
         }
         
         // User doesn't exist - create new profile using upsert
@@ -504,6 +508,114 @@ class SupabaseService: ObservableObject {
             print("⚠️ No user profile found for ID: \(userId)")
             return nil
         }
+    }
+    
+    func signInWithApple(idToken: String, nonce: String) async throws -> (UserProfile, String) {
+        print("🍎 Starting Apple Sign-In with Supabase")
+        print("🔑 Using nonce: \(nonce)")
+        
+        let authResult = try await client.auth.signInWithIdToken(
+            credentials: .init(provider: .apple, idToken: idToken, nonce: nonce)
+        )
+        
+        await MainActor.run {
+            self.currentUser = authResult.user
+            self.isAuthenticated = true
+        }
+        
+        // Check if user already exists by ID OR by email
+        let userEmail = authResult.user.email ?? ""
+        let userId = authResult.user.id.uuidString
+        
+        do {
+            // First try to find by ID (most reliable for Apple users)
+            let profilesById: [UserProfile] = try await client.database
+                .from("profiles")
+                .select()
+                .eq("id", value: userId)
+                .execute()
+                .value
+            
+            if let existingProfile = profilesById.first {
+                print("✅ Found existing Apple user profile by ID: \(existingProfile.name)")
+                return (existingProfile, authResult.accessToken)
+            }
+            
+            // If no profile found by ID, try by email (for users who signed up with email first)
+            if !userEmail.isEmpty {
+                let profilesByEmail: [UserProfile] = try await client.database
+                    .from("profiles")
+                    .select()
+                    .eq("email", value: userEmail)
+                    .execute()
+                    .value
+                
+                if let existingProfile = profilesByEmail.first {
+                    print("✅ Found existing user profile by email: \(existingProfile.name)")
+                    
+                    // Update the existing profile's ID to match Apple user ID for future logins
+                    let updatedProfile = UserProfile(
+                        id: userId, // Use Apple user ID
+                        email: existingProfile.email,
+                        name: existingProfile.name,
+                        skillLevel: existingProfile.skillLevel,
+                        instruments: existingProfile.instruments,
+                        practiceGoals: existingProfile.practiceGoals
+                    )
+                    
+                    // Update the profile with the new Apple user ID using upsert
+                    try await upsertUserProfile(updatedProfile)
+                    print("✅ Updated profile ID to match Apple user")
+                    
+                    return (updatedProfile, authResult.accessToken)
+                }
+            }
+            
+        } catch {
+            print("⚠️ Could not fetch existing profile: \(error)")
+        }
+        
+        // Only create new profile if no existing user found
+        let name = authResult.user.userMetadata["full_name"] as? String ?? 
+                   authResult.user.userMetadata["name"] as? String ?? 
+                   "Apple User"
+        
+        let newProfile = UserProfile(
+            id: userId,
+            email: userEmail,
+            name: name,
+            skillLevel: "Beginner",
+            instruments: []
+        )
+        
+        // Create new profile in database
+        do {
+            try await createUserProfile(newProfile)
+            print("✅ Created new Apple user profile: \(newProfile.name)")
+            return (newProfile, authResult.accessToken)
+        } catch {
+            print("⚠️ Failed to create new profile: \(error)")
+            throw error
+        }
+    }
+    
+    func deleteUserAccount() async throws {
+        print("🗑️ Deleting user account...")
+        
+        guard let currentUser = self.currentUser else {
+            throw NSError(domain: "NoCurrentUser", code: 1, userInfo: [NSLocalizedDescriptionKey: "No user is currently signed in"])
+        }
+        
+        // Delete user from Supabase Auth
+        try await client.auth.admin.deleteUser(id: currentUser.id)
+        
+        // Clear local session
+        await MainActor.run {
+            self.currentUser = nil
+            self.isAuthenticated = false
+        }
+        
+        print("✅ User account deleted successfully")
     }
 }
 
@@ -1089,17 +1201,65 @@ class DataManager: ObservableObject {
                         self.practiceSessions = convertedSessions.sorted { $0.date > $1.date }
                         print("📈 Force refresh: Total sessions now \(self.practiceSessions.count)")
                         
-                        // Update user profile with latest data from Supabase
+                        // Update user profile with latest data from Supabase, but preserve calculated stats
                         if let freshProfile = profile {
                             print("🔄 Updating user profile with Supabase data:")
-                            print("   Sessions: \(freshProfile.totalSessions)")
-                            print("   Accuracy: \(freshProfile.averageAccuracy)%")
-                            self.userProfile = freshProfile
-                            self.saveUserProfile(freshProfile)
+                            print("   Supabase Sessions: \(freshProfile.totalSessions)")
+                            print("   Supabase Accuracy: \(freshProfile.averageAccuracy)%")
+                            
+                            // Create a new profile that combines Supabase data with calculated stats
+                            var updatedProfile = freshProfile
+                            
+                            // Recalculate stats from the fresh session data
+                            updatedProfile.totalSessions = convertedSessions.count
+                            updatedProfile.totalPracticeTime = convertedSessions.reduce(0) { $0 + $1.duration }
+                            
+                            if !convertedSessions.isEmpty {
+                                updatedProfile.averageAccuracy = convertedSessions.reduce(0) { $0 + $1.accuracy } / Double(convertedSessions.count)
+                                updatedProfile.bestAccuracy = convertedSessions.map { $0.accuracy }.max() ?? 0.0
+                            } else {
+                                updatedProfile.averageAccuracy = 0.0
+                                updatedProfile.bestAccuracy = 0.0
+                            }
+                            
+                            // Calculate streak from fresh data
+                            let sortedSessions = convertedSessions.sorted { $0.date > $1.date }
+                            let calendar = Calendar.current
+                            let today = calendar.startOfDay(for: Date())
+                            let uniquePracticeDays = Array(Set(sortedSessions.map { calendar.startOfDay(for: $0.date) })).sorted(by: >)
+                            
+                            var consecutiveDays = 0
+                            var checkDate = today
+                            
+                            for practiceDay in uniquePracticeDays {
+                                let daysBetween = calendar.dateComponents([.day], from: practiceDay, to: checkDate).day ?? 0
+                                if daysBetween <= 1 {
+                                    consecutiveDays += 1
+                                    checkDate = calendar.date(byAdding: .day, value: -1, to: practiceDay) ?? practiceDay
+                                } else {
+                                    break
+                                }
+                            }
+                            
+                            updatedProfile.currentStreak = consecutiveDays
+                            
+                            print("✅ Final calculated stats:")
+                            print("   Total Sessions: \(updatedProfile.totalSessions)")
+                            print("   Average Accuracy: \(String(format: "%.1f", updatedProfile.averageAccuracy))%")
+                            print("   Best Accuracy: \(String(format: "%.1f", updatedProfile.bestAccuracy))%")
+                            print("   Current Streak: \(updatedProfile.currentStreak)")
+                            
+                            // Update the profile
+                            self.userProfile = updatedProfile
+                            self.saveUserProfile(updatedProfile)
+                            print("🔄 Profile updated with fresh stats")
+                        } else {
+                            // No profile from Supabase, just update stats from sessions
+                            self.updateUserStats()
                         }
                         
-                        // Update stats again with fresh data
-                        self.updateUserStats()
+                        // Mark refresh as complete
+                        self.isRefreshing = false
                     }
                 }
             } catch {
@@ -1211,6 +1371,64 @@ struct UserProfile: Codable {
     let updatedAt: Date
     var currentStreak: Int
     var bestAccuracy: Double
+    
+    // Custom coding keys to handle missing fields
+    enum CodingKeys: String, CodingKey {
+        case id, email, name
+        case skillLevel = "skill_level"
+        case instruments
+        case practiceGoals = "practice_goals"
+        case totalSessions = "total_sessions"
+        case totalPracticeTime = "total_practice_time"
+        case averageAccuracy = "average_accuracy"
+        case favoriteGenres = "favorite_genres"
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+        case currentStreak = "current_streak"
+        case bestAccuracy = "best_accuracy"
+    }
+    
+    // Custom decoder to handle missing fields
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        
+        id = try container.decode(String.self, forKey: .id)
+        email = try container.decode(String.self, forKey: .email)
+        name = try container.decode(String.self, forKey: .name)
+        
+        // Handle missing fields with defaults
+        skillLevel = try container.decodeIfPresent(String.self, forKey: .skillLevel) ?? "Beginner"
+        instruments = try container.decodeIfPresent([String].self, forKey: .instruments) ?? []
+        practiceGoals = try container.decodeIfPresent([String].self, forKey: .practiceGoals) ?? []
+        totalSessions = try container.decodeIfPresent(Int.self, forKey: .totalSessions) ?? 0
+        totalPracticeTime = try container.decodeIfPresent(TimeInterval.self, forKey: .totalPracticeTime) ?? 0.0
+        averageAccuracy = try container.decodeIfPresent(Double.self, forKey: .averageAccuracy) ?? 0.0
+        favoriteGenres = try container.decodeIfPresent([String].self, forKey: .favoriteGenres) ?? []
+        createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+        updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt) ?? Date()
+        currentStreak = try container.decodeIfPresent(Int.self, forKey: .currentStreak) ?? 0
+        bestAccuracy = try container.decodeIfPresent(Double.self, forKey: .bestAccuracy) ?? 0.0
+    }
+    
+    // Custom encoder
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        
+        try container.encode(id, forKey: .id)
+        try container.encode(email, forKey: .email)
+        try container.encode(name, forKey: .name)
+        try container.encode(skillLevel, forKey: .skillLevel)
+        try container.encode(instruments, forKey: .instruments)
+        try container.encode(practiceGoals, forKey: .practiceGoals)
+        try container.encode(totalSessions, forKey: .totalSessions)
+        try container.encode(totalPracticeTime, forKey: .totalPracticeTime)
+        try container.encode(averageAccuracy, forKey: .averageAccuracy)
+        try container.encode(favoriteGenres, forKey: .favoriteGenres)
+        try container.encode(createdAt, forKey: .createdAt)
+        try container.encode(updatedAt, forKey: .updatedAt)
+        try container.encode(currentStreak, forKey: .currentStreak)
+        try container.encode(bestAccuracy, forKey: .bestAccuracy)
+    }
     
     init(id: String, email: String, name: String, skillLevel: String = "beginner", instruments: [String] = [], practiceGoals: [String] = []) {
         self.id = id
@@ -1560,6 +1778,11 @@ class AppState: ObservableObject {
             self.currentScreen = .main
             print("✅ User automatically logged in from saved session")
             print("🆔 Restored user ID from saved profile: \(self.currentUserId)")
+            
+            // Refresh stats to ensure accurate data is displayed
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                self.dataManager.forceRefreshStats()
+            }
         } else {
             // Clear any invalid saved data
             UserDefaults.standard.removeObject(forKey: "supabaseAccessToken")
@@ -1593,6 +1816,11 @@ class AppState: ObservableObject {
         print("✅ User session saved for persistent login")
         print("🆔 User ID: \(self.currentUserId)")
         print("🔑 Access token saved")
+        
+        // Immediately refresh stats to ensure accurate data is displayed
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            self.dataManager.forceRefreshStats()
+        }
     }
     
     func logout() {
@@ -1653,6 +1881,24 @@ class AppState: ObservableObject {
         self.currentUserId = ""
         self.currentScreen = .login
         print("🔄 Complete app state reset - ready for fresh test")
+    }
+    
+    func deleteAccount() async throws {
+        print("🗑️ Starting account deletion process...")
+        
+        // Delete from Supabase
+        try await supabaseService.deleteUserAccount()
+        
+        // Clear all local data
+        dataManager.clearAllData()
+        
+        // Reset app state
+        await MainActor.run {
+            self.resetAppState()
+            self.isLoggedIn = false
+        }
+        
+        print("✅ Account deletion completed")
     }
     
 }
@@ -2093,6 +2339,7 @@ struct LoginScreen: View {
     @State private var isLoading = false
     @State private var showPassword = false
     @State private var showConfirmPassword = false
+    @State private var currentNonce: String?
     
     var body: some View {
         ZStack {
@@ -2293,6 +2540,21 @@ struct LoginScreen: View {
                             }
                             .buttonStyle(PlainButtonStyle())
                             
+                            // Apple Sign-In Button
+                            SignInWithAppleButton(
+                                onRequest: { request in
+                                    request.requestedScopes = [.fullName, .email]
+                                    currentNonce = randomNonceString()
+                                    request.nonce = sha256(currentNonce!)
+                                },
+                                onCompletion: { result in
+                                    handleAppleSignInResult(result)
+                                }
+                            )
+                            .signInWithAppleButtonStyle(.black)
+                            .frame(height: 50)
+                            .cornerRadius(12)
+                            
                         }
                         .padding(.top, 20)
                     }
@@ -2437,6 +2699,95 @@ struct LoginScreen: View {
         let emailRegex = "[A-Z0-9a-z._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,64}"
         let emailPredicate = NSPredicate(format:"SELF MATCHES %@", emailRegex)
         return emailPredicate.evaluate(with: email)
+    }
+    
+    // MARK: - Apple Sign-In Helper Functions
+    private func sha256(_ input: String) -> String {
+        let inputData = Data(input.utf8)
+        let hashedData = SHA256.hash(data: inputData)
+        let hashString = hashedData.compactMap {
+            return String(format: "%02x", $0)
+        }.joined()
+        return hashString
+    }
+    
+    private func randomNonceString(length: Int = 32) -> String {
+        precondition(length > 0)
+        let charset: [Character] =
+        Array("0123456789ABCDEFGHIJKLMNOPQRSTUVXYZabcdefghijklmnopqrstuvwxyz-._")
+        var result = ""
+        var remainingLength = length
+        
+        while remainingLength > 0 {
+            let randoms: [UInt8] = (0 ..< 16).map { _ in
+                var random: UInt8 = 0
+                let errorCode = SecRandomCopyBytes(kSecRandomDefault, 1, &random)
+                if errorCode != errSecSuccess {
+                    fatalError("Unable to generate nonce. SecRandomCopyBytes failed with OSStatus \(errorCode)")
+                }
+                return random
+            }
+            
+            randoms.forEach { random in
+                if remainingLength == 0 {
+                    return
+                }
+                
+                if random < charset.count {
+                    result.append(charset[Int(random)])
+                    remainingLength -= 1
+                }
+            }
+        }
+        
+        return result
+    }
+    
+    private func handleAppleSignInResult(_ result: Result<ASAuthorization, Error>) {
+        switch result {
+        case .success(let authorization):
+            if let appleIDCredential = authorization.credential as? ASAuthorizationAppleIDCredential {
+                guard let nonce = currentNonce else {
+                    fatalError("Invalid state: A login callback was received, but no login request was sent.")
+                }
+                guard let appleIDToken = appleIDCredential.identityToken else {
+                    print("Unable to fetch identity token")
+                    return
+                }
+                guard let idTokenString = String(data: appleIDToken, encoding: .utf8) else {
+                    print("Unable to serialize token string from data: \(appleIDToken.debugDescription)")
+                    return
+                }
+                
+                Task {
+                    do {
+                        let (profile, accessToken) = try await appState.supabaseService.signInWithApple(
+                            idToken: idTokenString,
+                            nonce: currentNonce ?? ""
+                        )
+                        
+                        await MainActor.run {
+                            self.isLoading = false
+                            self.appState.saveUserSession(profile: profile, accessToken: accessToken)
+                            
+                            withAnimation {
+                                self.appState.currentScreen = .main
+                            }
+                        }
+                    } catch {
+                        await MainActor.run {
+                            self.isLoading = false
+                            self.alertMessage = "Apple Sign-In failed: \(error.localizedDescription)"
+                            self.showingAlert = true
+                        }
+                    }
+                }
+            }
+        case .failure(let error):
+            print("Apple Sign-In failed: \(error.localizedDescription)")
+            alertMessage = "Apple Sign-In failed: \(error.localizedDescription)"
+            showingAlert = true
+        }
     }
     
     private func signInWithGoogle() {
@@ -2617,7 +2968,7 @@ struct HomeScreen: View {
                     VStack(spacing: 24) {
                         appHeader
                         welcomeMessage
-                        ModernStatsCards(appState: appState)
+                        ModernStatsCards(appState: appState, dataManager: appState.dataManager)
                         QuickActionsSection(showingQuickPractice: $showingQuickPractice)
                         quickActionsSection
                     }
@@ -2839,6 +3190,7 @@ struct QuickActionCard: View {
 
 struct ModernStatsCards: View {
     @ObservedObject var appState: AppState
+    @ObservedObject var dataManager: DataManager
     
     var body: some View {
         VStack(spacing: 16) {
@@ -2857,7 +3209,7 @@ struct ModernStatsCards: View {
         ], spacing: 16) {
                 ModernStatCard(
                     title: "Total Sessions",
-                    value: "\(appState.userProfile?.totalSessions ?? 0)",
+                    value: "\(dataManager.userProfile?.totalSessions ?? 0)",
                     subtitle: "sessions",
                     icon: "music.note",
                     color: .purple,
@@ -2865,7 +3217,7 @@ struct ModernStatsCards: View {
                 )
                 ModernStatCard(
                     title: "Avg Accuracy",
-                    value: "\(Int(appState.userProfile?.averageAccuracy ?? 0))%",
+                    value: "\(Int(dataManager.userProfile?.averageAccuracy ?? 0))%",
                     subtitle: "overall",
                     icon: "target",
                     color: .green,
@@ -5318,6 +5670,8 @@ struct ModernSessionRow: View {
 struct ProfileScreen: View {
     @ObservedObject var appState: AppState
     @State private var showingLogoutAlert = false
+    @State private var showingDeleteAlert = false
+    @State private var isDeletingAccount = false
     
     var body: some View {
         NavigationView {
@@ -5331,7 +5685,31 @@ struct ProfileScreen: View {
                         ProfileStats(appState: appState)
                         SettingsSection()
                         
-                            LogoutButton(showingLogoutAlert: $showingLogoutAlert, appState: appState)
+                        LogoutButton(showingLogoutAlert: $showingLogoutAlert, appState: appState)
+                        
+                        // Delete Account Button
+                        Button(action: {
+                            showingDeleteAlert = true
+                        }) {
+                            HStack {
+                                if isDeletingAccount {
+                                    ProgressView()
+                                        .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                                        .scaleEffect(0.8)
+                                } else {
+                                    Image(systemName: "trash.fill")
+                                        .foregroundColor(.white)
+                                }
+                                Text(isDeletingAccount ? "Deleting Account..." : "Delete Account")
+                                    .fontWeight(.medium)
+                            }
+                            .foregroundColor(.white)
+                            .frame(maxWidth: .infinity)
+                            .padding()
+                            .background(Color.red.opacity(0.8))
+                            .cornerRadius(12)
+                        }
+                        .disabled(isDeletingAccount)
                     }
                     .padding(.horizontal, 20)
                 }
@@ -5346,6 +5724,23 @@ struct ProfileScreen: View {
             }
         } message: {
             Text("Are you sure you want to logout?")
+        }
+        .alert("Delete Account", isPresented: $showingDeleteAlert) {
+            Button("Cancel", role: .cancel) { }
+            Button("Delete Forever", role: .destructive) {
+                Task {
+                    isDeletingAccount = true
+                    do {
+                        try await appState.deleteAccount()
+                        // Account deletion will automatically navigate to login screen
+                    } catch {
+                        print("❌ Failed to delete account: \(error)")
+                        isDeletingAccount = false
+                    }
+                }
+            }
+        } message: {
+            Text("This will permanently delete your account and all your data. This action cannot be undone.")
         }
     }
 }

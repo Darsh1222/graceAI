@@ -43,7 +43,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
-		25E1E7E32E2982540018D11A /* GraceAI.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = GraceAI.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		25E1E7E32E2982540018D11A /* GraceAI - Master Your Music.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "GraceAI - Master Your Music.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		25E1E7F02E2982550018D11A /* TuneIn CursorTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "TuneIn CursorTests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 		25E1E7FA2E2982550018D11A /* TuneIn CursorUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "TuneIn CursorUITests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 		25E1E88F2E43DE060018D11A /* AuthenticationServices.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AuthenticationServices.framework; path = System/Library/Frameworks/AuthenticationServices.framework; sourceTree = SDKROOT; };
@@ -109,7 +109,7 @@
 		25E1E7E42E2982540018D11A /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				25E1E7E32E2982540018D11A /* GraceAI.app */,
+				25E1E7E32E2982540018D11A /* GraceAI - Master Your Music.app */,
 				25E1E7F02E2982550018D11A /* TuneIn CursorTests.xctest */,
 				25E1E7FA2E2982550018D11A /* TuneIn CursorUITests.xctest */,
 			);
@@ -150,7 +150,7 @@
 				25B620772E77671F00EEC878 /* Supabase */,
 			);
 			productName = "TuneIn Cursor";
-			productReference = 25E1E7E32E2982540018D11A /* GraceAI.app */;
+			productReference = 25E1E7E32E2982540018D11A /* GraceAI - Master Your Music.app */;
 			productType = "com.apple.product-type.application";
 		};
 		25E1E7EF2E2982550018D11A /* TuneIn CursorTests */ = {
@@ -433,6 +433,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = "TuneIn Cursor/TuneIn Cursor.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = FNMT325P7M;
@@ -468,6 +469,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = "TuneIn Cursor/TuneIn Cursor.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = FNMT325P7M;
