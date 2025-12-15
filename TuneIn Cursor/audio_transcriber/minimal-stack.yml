@@ -1,0 +1,15 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Minimal TuneIn Cursor Stack'
+
+Resources:
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: tunein-cursor-production
+      ImageScanningConfiguration:
+        ScanOnPush: true
+
+Outputs:
+  RepositoryName:
+    Description: ECR Repository Name
+    Value: !Ref ECRRepository

@@ -1,0 +1,68 @@
+{
+    "family": "tunein-cursor-task",
+    "networkMode": "awsvpc",
+    "requiresCompatibilities": ["FARGATE"],
+    "cpu": "512",
+    "memory": "1024",
+    "executionRoleArn": "arn:aws:iam::508426718674:role/ecsTaskExecutionRole",
+    "containerDefinitions": [
+        {
+            "name": "tunein-backend",
+            "image": "508426718674.dkr.ecr.us-east-1.amazonaws.com/tunein-cursor-simple:latest",
+            "cpu": 0,
+            "portMappings": [
+                {
+                    "containerPort": 8000,
+                    "hostPort": 8000,
+                    "protocol": "tcp",
+                    "name": "tunein-backend-8000-tcp",
+                    "appProtocol": "http"
+                }
+            ],
+            "essential": true,
+            "environment": [
+                {
+                    "name": "HOST",
+                    "value": "0.0.0.0"
+                },
+                {
+                    "name": "PORT",
+                    "value": "8000"
+                },
+                {
+                    "name": "SUPABASE_KEY",
+                    "value": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNqcW1uem5pcGp3ZHhncWRlZ292Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTQ1MDQ5NzEsImV4cCI6MjA3MDA4MDk3MX0.2de1-z-UxDP9EkBq4DfGSponnioTLtOy1Vy4y9lsZWg"
+                },
+                {
+                    "name": "SUPABASE_URL",
+                    "value": "https://cjqmnznipjwdxgqdegov.supabase.co"
+                },
+                {
+                    "name": "ENVIRONMENT",
+                    "value": "production"
+                }
+            ],
+            "mountPoints": [],
+            "volumesFrom": [],
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group": "/ecs/tunein-cursor-task",
+                    "awslogs-create-group": "true",
+                    "awslogs-region": "us-east-1",
+                    "awslogs-stream-prefix": "ecs"
+                }
+            },
+            "healthCheck": {
+                "command": [
+                    "CMD-SHELL",
+                    "curl -f http://localhost:8000/health || exit 1"
+                ],
+                "interval": 30,
+                "timeout": 10,
+                "retries": 3,
+                "startPeriod": 60
+            }
+        }
+    ]
+}
